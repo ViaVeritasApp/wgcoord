@@ -1,0 +1,104 @@
+name: Release
+
+# Packages the wgcoord CLI for every supported target and publishes a GitHub
+# release with the archives on v*.*.* tags. Windows is intentionally omitted:
+# the coordinator uses syscall.Flock (unix-only).
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test -race ./...
+
+  build:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,  goarch: amd64 }
+          - { goos: linux,  goarch: arm64 }
+          - { goos: linux,  goarch: arm,   goarm: '7' }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Build and package
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then VER="${GITHUB_REF_NAME}"; else VER="0.0.0-dev+${GITHUB_SHA::7}"; fi
+          ARCH='${{ matrix.goarch }}'
+          [ "$ARCH" = arm ] && ARCH=armv7
+          NAME="wgcoord_${VER}_${{ matrix.goos }}_${ARCH}"
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w" -o dist/wgcoord ./cmd/wgcoord
+          cd dist
+          tar -czf "${NAME}.tar.gz" wgcoord
+          sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+          rm -f wgcoord
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wgcoord-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combine checksums
+        run: cat dist/*.sha256 > dist/SHA256SUMS.txt
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true
