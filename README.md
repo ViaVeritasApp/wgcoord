@@ -42,6 +42,21 @@ off from the mesh.
    (and on demand). Blacklisting a client removes it from the hub interface and
    from every other client's config on their next heartbeat.
 
+### The control plane is out-of-band
+
+**All coordinator requests happen outside the WireGuard network.** Both
+`register` and `heartbeat` travel over the client's ordinary network to the
+coordinator's **public** control endpoint (e.g. `http://203.0.113.1:51821`) —
+**not** through the mesh tunnel. This is by design: a client must reach the
+coordinator to obtain its address and peer set *before* any tunnel exists, and
+it keeps heartbeating over that same public URL afterwards. The data plane (mesh
+UDP) and the control plane (HTTP) are entirely separate paths.
+
+The consequence: the control plane is **not** protected by WireGuard's
+encryption, yet it carries bearer tokens and public keys. In any real deployment
+run it over HTTPS — either with the built-in TLS flags or, preferably, behind a
+reverse proxy (see [HTTPS / reverse proxy](#https--reverse-proxy)).
+
 ## Build & install
 
 Requires Go ≥ 1.25.
@@ -64,65 +79,176 @@ Always written `0600` (it holds private keys and, on clients, the token).
 
 ## Coordinator
 
+Manage and run the hub. Every management command edits the shared `config.json`
+under a file lock; a running `coordinator run` picks up the change on its next
+reconcile (≤15s). Run them as the **same user** as the daemon — root, when the
+config lives in `/etc/wgcoord/`.
+
+| Command | What it does | Example |
+|---|---|---|
+| `coordinator init` | Initialize this host as the hub (writes config, generates the hub keypair). | `wgcoord coordinator init --public-ip 203.0.113.1` |
+| `coordinator run` | Start the control plane and manage the hub interface (foreground; alias `serve`). | `wgcoord coordinator run` |
+| `coordinator client add <name>` | Create a named client and print its one-time token + join command. | `wgcoord coordinator client add laptop` |
+| `coordinator client remove <name>` | Delete a client from the registry (aliases `rm`, `delete`). | `wgcoord coordinator client remove laptop` |
+| `coordinator client rename <old> <new>` | Rename a client. | `wgcoord coordinator client rename laptop workstation` |
+| `coordinator token regenerate <name>` | Rotate a client's token; the old one stops working immediately (aliases `regen`, `new`). | `wgcoord coordinator token regenerate laptop` |
+| `coordinator blacklist <name>` | Block a client — refused at the control plane and dropped from the hub. | `wgcoord coordinator blacklist laptop` |
+| `coordinator blacklist remove <name>` | Lift the blacklist; the client may rejoin on its next heartbeat. | `wgcoord coordinator blacklist remove laptop` |
+| `coordinator status` | Show the hub and every configured client. | `wgcoord coordinator status` |
+
+The `coordinator` command also accepts the alias `coord`.
+
+**`coordinator init` flags**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--public-ip` | (none) | Public IP/host clients dial to reach the hub. Without it, clients can't join until one is set. |
+| `--control-port` | `51821` | HTTP control-plane (TCP) port for register/heartbeat. |
+| `--wg-port` | `51820` | Hub WireGuard UDP port. |
+| `--client-wg-port` | `51820` | Default WireGuard UDP port advertised for clients. |
+| `--ip-range` | `10.8.0.0/24` | Mesh address pool (CIDR). |
+| `--address` | first host | Hub's own mesh IP (e.g. `10.8.0.1`). |
+| `--interface` | `wg0` | WireGuard interface name. |
+| `--tls-cert` | (none) | TLS certificate file for the control plane (enables HTTPS directly). |
+| `--tls-key` | (none) | TLS private key file for the control plane (enables HTTPS directly). |
+| `--force` | `false` | Overwrite an existing config. |
+
+**`coordinator client add` flags**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--address` | auto | Assign a specific mesh IP; otherwise the lowest free host is allocated. |
+
+Example — initialize the hub, add a client with a pinned IP, then run:
+
 ```bash
-# Initialize the hub. Range defaults to 10.8.0.0/24 (hub takes 10.8.0.1).
 wgcoord coordinator init \
   --public-ip 203.0.113.1 \      # public IP/host clients dial to reach the hub
-  --control-port 51821 \         # HTTP control-plane port  (default 51821)
-  --wg-port 51820 \              # hub WireGuard UDP port    (default 51820)
-  --client-wg-port 51820 \       # WG port advertised for clients (default 51820)
+  --control-port 51821 \         # HTTP control-plane port
+  --wg-port 51820 \              # hub WireGuard UDP port
   --ip-range 10.8.0.0/24 \       # mesh address pool
-  --address 10.8.0.1 \           # hub's own mesh IP (default: first host)
   --interface wg0
 
-# Create a named client and print its one-time token + join command.
-wgcoord coordinator client add laptop
-wgcoord coordinator client add server-a --address 10.8.0.20   # pin a specific IP
-
-wgcoord coordinator client rename laptop workstation
-wgcoord coordinator client remove server-a
-
-# Rotate a client's token (old one stops working immediately).
-wgcoord coordinator token regenerate laptop
-
-# Blacklist / un-blacklist (cuts the client off from the mesh).
-wgcoord coordinator blacklist laptop
-wgcoord coordinator blacklist remove laptop
-
-# Show the hub and every configured client.
-wgcoord coordinator status
-
-# Run the control plane + manage the hub interface (foreground; Ctrl+C stops).
+wgcoord coordinator client add server-a --address 10.8.0.20
 wgcoord coordinator run
 ```
 
-Run `wgcoord coordinator run` under your init system (systemd, etc.) so it stays
-up. The management commands above can be run at any time from the same host —
-they edit the shared config under a file lock and the daemon picks up the change
-on its next reconcile.
-
 ## Client
 
-```bash
-# Join using the token from `coordinator client add`.
-wgcoord client join \
-  --server http://203.0.113.1:51821 \
-  --token  <TOKEN> \
-  --public-ip 198.51.100.7 \   # this node's public IP/host, shared to peers (optional for NAT)
-  --address 10.8.0.30 \        # request a specific mesh IP (granted if free; optional)
-  --interface wg0
+Join a coordinator and keep this node's interface in sync.
 
-# Heartbeat + keep the interface in sync (foreground; Ctrl+C stops).
-wgcoord client run
+| Command | What it does | Example |
+|---|---|---|
+| `client join` | Register with a coordinator using a token; write config and apply the first peer set. | `wgcoord client join --server http://203.0.113.1:51821 --token <TOKEN>` |
+| `client run` | Heartbeat the coordinator and keep the interface in sync (foreground). | `wgcoord client run` |
+| `client sync` | Send one heartbeat, fetch missing peers, and re-apply. | `wgcoord client sync` |
+| `client up` | Apply the cached peer set to the interface (no coordinator call). | `wgcoord client up` |
+| `client down` | Tear down the WireGuard interface. | `wgcoord client down` |
+| `client status` | Show this node's identity and its peers. | `wgcoord client status` |
 
-wgcoord client sync     # one-shot heartbeat + apply
-wgcoord client up       # apply cached peers without contacting the coordinator
-wgcoord client down     # tear down the interface
-wgcoord client status   # this node's identity + its peers
-```
+**`client join` flags**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--server` | (required) | Coordinator control-plane URL, e.g. `http://203.0.113.1:51821` (or `https://…` behind a proxy). |
+| `--token` | (required) | Auth token from `coordinator client add`. |
+| `--public-ip` | (none) | This node's public IP/host to share with peers. Omit behind NAT. |
+| `--address` | auto | Request a specific mesh IP (granted if free). |
+| `--interface` | `wg0` | WireGuard interface name. |
+| `--wg-port` | `51820` | Local WireGuard UDP port. |
+| `--keepalive` | `25` | Persistent-keepalive seconds toward peers. |
+| `--heartbeat` | `25` | Heartbeat interval seconds. |
 
 A client behind NAT can omit `--public-ip`; it still reaches peers by dialing
-out and is kept reachable by persistent-keepalive (default 25s).
+out and is kept reachable by persistent-keepalive:
+
+```bash
+wgcoord client join \
+  --server http://203.0.113.1:51821 \
+  --token <TOKEN>
+wgcoord client run
+```
+
+**Global flag:** `--config <path>` (available on every command) overrides the
+config location; `$WGCOORD_CONFIG` does the same. See
+[Configuration file](#configuration-file).
+
+## Running as a service (systemd)
+
+Both modes run a foreground daemon (`coordinator run` / `client run`), so they
+belong under an init system. Initialize/join **first** — `run` needs an existing
+config — then install the unit.
+
+### Coordinator
+
+Bootstrap the hub, then install and start the unit:
+
+```bash
+sudo wgcoord coordinator init --public-ip 203.0.113.1
+sudo wgcoord coordinator client add laptop      # note the printed token for the client
+```
+
+`/etc/systemd/system/wgcoord-coordinator.service`:
+
+```ini
+[Unit]
+Description=wgcoord coordinator (WireGuard mesh control plane)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wgcoord coordinator run
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now wgcoord-coordinator
+sudo journalctl -u wgcoord-coordinator -f
+```
+
+The unit runs as **root** so wgcoord can program the interface (`wg syncconf` +
+`ip`) and read `/etc/wgcoord/config.json`. Run the management commands
+(`client add`, `blacklist`, …) with `sudo` too, so they edit the same config the
+daemon uses.
+
+### Client
+
+Join first (this writes the config and brings the interface up once), then hand
+the heartbeat loop to systemd:
+
+```bash
+sudo wgcoord client join --server http://203.0.113.1:51821 --token <TOKEN>
+```
+
+`/etc/systemd/system/wgcoord-client.service`:
+
+```ini
+[Unit]
+Description=wgcoord client (WireGuard mesh member)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wgcoord client run
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now wgcoord-client
+sudo journalctl -u wgcoord-client -f
+```
 
 ## Notes
 
