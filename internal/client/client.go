@@ -11,8 +11,10 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"wgcoord/internal/api"
@@ -22,7 +24,30 @@ import (
 	"wgcoord/internal/wgkey"
 )
 
-var httpClient = &http.Client{Timeout: 15 * time.Second}
+const (
+	// requestTimeout bounds a control-plane call over the public URL.
+	requestTimeout = 15 * time.Second
+	// internalTimeout bounds the over-mesh attempt. A live tunnel answers in
+	// milliseconds, so a short deadline keeps a dead one from stalling the beat
+	// before the public fallback runs.
+	internalTimeout = 5 * time.Second
+	// internalCooldown is how long the client sticks to the public URL after an
+	// over-mesh attempt fails, so a broken tunnel costs one stall, not every beat.
+	internalCooldown = 5 * time.Minute
+)
+
+var httpClient = &http.Client{Timeout: requestTimeout}
+
+// internalUntil is when over-mesh attempts may resume after a failure; it is
+// process-local, so a one-shot `client sync` always gives the mesh one try.
+var (
+	internalMu    sync.Mutex
+	internalUntil time.Time
+)
+
+// meshAvailable reports whether this host can hold a live tunnel at all;
+// indirected for tests.
+var meshAvailable = wgctl.Available
 
 // JoinOptions configures a first-time join.
 type JoinOptions struct {
@@ -69,6 +94,7 @@ func Join(o JoinOptions) (*config.ClientConfig, error) {
 	cc.Name = resp.Name
 	cc.Address = resp.Address
 	cc.IPRange = resp.IPRange
+	cc.InternalURL = resp.ControlURL
 	cc.Peers = toPeers(resp.Peers)
 	if err := save(cc); err != nil {
 		return nil, err
@@ -99,6 +125,9 @@ func Sync() (*config.ClientConfig, *api.HeartbeatResponse, error) {
 	if resp.IPRange != "" {
 		cc.IPRange = resp.IPRange
 	}
+	// Tracked verbatim: an empty value means the hub no longer offers an in-mesh
+	// control plane, and the client should stop preferring the old one.
+	cc.InternalURL = resp.ControlURL
 	if err := save(cc); err != nil {
 		return nil, nil, err
 	}
@@ -112,7 +141,11 @@ func Run(ctx context.Context, logger *log.Logger) error {
 		return err
 	}
 	interval := cc.HeartbeatInterval()
-	logger.Printf("client %q up; beating %s every %s", cc.Name, cc.CoordinatorURL, interval)
+	target := cc.CoordinatorURL
+	if cc.InternalURL != "" {
+		target = fmt.Sprintf("%s (over the mesh, falling back to %s)", cc.InternalURL, cc.CoordinatorURL)
+	}
+	logger.Printf("client %q up; beating %s every %s", cc.Name, target, interval)
 	beat(logger)
 
 	ticker := time.NewTicker(interval)
@@ -257,34 +290,110 @@ func save(cc *config.ClientConfig) error {
 	return config.Save(&config.Config{Mode: config.ModeClient, Client: cc})
 }
 
+// post sends a control-plane request, preferring the coordinator's in-mesh
+// address once this node has a tunnel — the token then never leaves WireGuard —
+// and falling back to the public URL it joined with when that path fails.
 func post(cc *config.ClientConfig, path string, body, out any) error {
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, cc.CoordinatorURL+path, bytes.NewReader(buf))
+	if base := internalBase(cc); base != "" {
+		retry, err := do(cc, base+path, buf, out, internalTimeout)
+		if err == nil {
+			return nil
+		}
+		if !retry {
+			return err // the coordinator answered, so the mesh path itself works
+		}
+		coolDownInternal()
+		log.Printf("control plane: %s over the mesh failed (%v) — using %s for the next %s",
+			path, err, cc.CoordinatorURL, internalCooldown)
+	}
+	_, err = do(cc, cc.CoordinatorURL+path, buf, out, requestTimeout)
+	return err
+}
+
+// do posts one request. retry reports whether the failure was a transport-level
+// one (dial, timeout, 5xx) — worth trying over another path — as opposed to a
+// definitive answer from the coordinator, which would be the same either way.
+func do(cc *config.ClientConfig, endpoint string, body []byte, out any, timeout time.Duration) (retry bool, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cc.Token)
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("contact coordinator: %w", err)
+		return true, fmt.Errorf("contact coordinator: %w", err)
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode/100 != 2 {
+		msg := fmt.Sprintf("coordinator returned %d", resp.StatusCode)
 		var e api.ErrorResponse
 		if json.Unmarshal(data, &e) == nil && e.Error != "" {
-			return fmt.Errorf("coordinator %d: %s", resp.StatusCode, e.Error)
+			msg = fmt.Sprintf("coordinator %d: %s", resp.StatusCode, e.Error)
 		}
-		return fmt.Errorf("coordinator returned %d", resp.StatusCode)
+		return resp.StatusCode/100 == 5, errors.New(msg)
 	}
 	if out == nil {
-		return nil
+		return false, nil
 	}
-	return json.Unmarshal(data, out)
+	// A decode failure is never retried: out may already be half-written, and
+	// re-decoding the other path's body into it would merge two responses.
+	return false, json.Unmarshal(data, out)
+}
+
+// internalBase returns the coordinator's in-mesh control URL when it is worth
+// trying: advertised by the hub, inside the mesh range, reachable through an
+// interface this host can actually bring up, and not cooling down from a
+// recent failure.
+func internalBase(cc *config.ClientConfig) string {
+	if cc.InternalURL == "" || cc.InternalURL == cc.CoordinatorURL || cc.Address == "" {
+		return ""
+	}
+	if !inMesh(cc, cc.InternalURL) || !hasCoordinatorPeer(cc) {
+		return "" // no tunnel carries this address
+	}
+	if !meshAvailable() {
+		return "" // live apply is impossible here, so the mesh routes nowhere
+	}
+	internalMu.Lock()
+	defer internalMu.Unlock()
+	if time.Now().Before(internalUntil) {
+		return ""
+	}
+	return cc.InternalURL
+}
+
+func coolDownInternal() {
+	internalMu.Lock()
+	defer internalMu.Unlock()
+	internalUntil = time.Now().Add(internalCooldown)
+}
+
+// inMesh checks that raw points at an address inside the mesh pool: the
+// coordinator is trusted, but only the tunnel makes this path worth preferring.
+func inMesh(cc *config.ClientConfig, raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || cc.IPRange == "" {
+		return false
+	}
+	ok, err := ipalloc.Usable(cc.IPRange, u.Hostname())
+	return err == nil && ok
+}
+
+func hasCoordinatorPeer(cc *config.ClientConfig) bool {
+	for _, p := range cc.Peers {
+		if p.ID == api.CoordinatorPeerID {
+			return true
+		}
+	}
+	return false
 }
 
 func orStr(v, def string) string {

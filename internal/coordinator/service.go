@@ -46,7 +46,7 @@ func (s *Service) Serve(ctx context.Context) error {
 		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	tlsOn := cc.TLSCertFile != "" && cc.TLSKeyFile != ""
+	tlsOn := cc.TLSEnabled()
 
 	s.reconcile() // apply current state before accepting clients
 

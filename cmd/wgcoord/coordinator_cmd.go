@@ -254,6 +254,11 @@ func coordStatusCmd() *cobra.Command {
 			if cc.PublicEndpoint != "" {
 				fmt.Printf("  public %s\n", net.JoinHostPort(cc.PublicEndpoint, strconv.Itoa(cc.ListenPort)))
 			}
+			fmt.Printf("  control plane %s (public)", coordinatorURLHint(cc))
+			if in := cc.InternalControlURL(); in != "" {
+				fmt.Printf(", %s (mesh — clients prefer this once their tunnel is up)", in)
+			}
+			fmt.Println()
 			fmt.Printf("\n%d client(s):\n", len(cc.Clients))
 			if len(cc.Clients) == 0 {
 				return nil
@@ -280,12 +285,16 @@ func clientStatus(cl *config.Client) string {
 	return "registered"
 }
 
-// coordinatorURLHint builds the control-plane URL to print in join instructions,
-// preferring the configured public endpoint.
+// coordinatorURLHint builds the public control-plane URL to print in join
+// instructions, on the scheme the hub actually serves.
 func coordinatorURLHint(cc *config.CoordinatorConfig) string {
 	host := cc.PublicEndpoint
 	if host == "" {
 		host = "<coordinator-host>"
 	}
-	return "http://" + net.JoinHostPort(host, strconv.Itoa(cc.ControlPort))
+	scheme := "http"
+	if cc.TLSEnabled() {
+		scheme = "https"
+	}
+	return scheme + "://" + net.JoinHostPort(host, strconv.Itoa(cc.ControlPort))
 }
