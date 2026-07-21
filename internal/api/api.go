@@ -27,11 +27,12 @@ type RegisterRequest struct {
 
 // RegisterResponse returns the assigned address and the full current peer set.
 type RegisterResponse struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Address string `json:"address"`
-	IPRange string `json:"ip_range"`
-	Peers   []Peer `json:"peers"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Address    string `json:"address"`
+	IPRange    string `json:"ip_range"`
+	ControlURL string `json:"control_url,omitempty"` // see HeartbeatResponse.ControlURL
+	Peers      []Peer `json:"peers"`
 }
 
 // HeartbeatRequest is posted to POST /heartbeat. Have lists the peer ids the
@@ -46,10 +47,15 @@ type HeartbeatRequest struct {
 // HeartbeatResponse is the peer delta: Add for missing/changed peers, Remove
 // for ids to drop (blacklisted or deleted).
 type HeartbeatResponse struct {
-	Address string   `json:"address"`
-	IPRange string   `json:"ip_range"`
-	Add     []Peer   `json:"add"`
-	Remove  []string `json:"remove"`
+	Address string `json:"address"`
+	IPRange string `json:"ip_range"`
+	// ControlURL is the coordinator's control plane as reached *through* the
+	// mesh (e.g. http://10.8.0.1:51821). A client whose tunnel is up should
+	// prefer it — the request then travels encrypted — and fall back to the
+	// public URL it joined with whenever that path fails.
+	ControlURL string   `json:"control_url,omitempty"`
+	Add        []Peer   `json:"add"`
+	Remove     []string `json:"remove"`
 }
 
 // ErrorResponse is the body returned for any non-2xx control-plane response.

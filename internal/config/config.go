@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
@@ -77,7 +79,11 @@ type Client struct {
 // ClientConfig is a client machine's state: how to reach the coordinator, its
 // own WireGuard identity, and the last peer set it was handed.
 type ClientConfig struct {
-	CoordinatorURL   string `json:"coordinator_url"`
+	CoordinatorURL string `json:"coordinator_url"`
+	// InternalURL is the coordinator's control plane as reached through the
+	// mesh, advertised by the hub on register/heartbeat. Preferred once the
+	// tunnel is up; CoordinatorURL stays the fallback.
+	InternalURL      string `json:"internal_url,omitempty"`
 	Token            string `json:"token"` // plaintext auth token; the file is 0600
 	ID               string `json:"id,omitempty"`
 	Name             string `json:"name,omitempty"`
@@ -100,6 +106,26 @@ type Peer struct {
 	PublicKey  string `json:"public_key"`
 	Endpoint   string `json:"endpoint,omitempty"`
 	AllowedIPs string `json:"allowed_ips"`
+}
+
+// TLSEnabled reports whether the control plane serves HTTPS itself, as opposed
+// to plaintext behind a TLS-terminating proxy.
+func (c *CoordinatorConfig) TLSEnabled() bool {
+	return c.TLSCertFile != "" && c.TLSKeyFile != ""
+}
+
+// InternalControlURL is the control plane as reached from inside the mesh: the
+// hub's own mesh address on the control port. Clients with a live tunnel prefer
+// it over the public URL, so register/heartbeat travel inside WireGuard.
+func (c *CoordinatorConfig) InternalControlURL() string {
+	if c.Address == "" || c.ControlPort <= 0 {
+		return ""
+	}
+	scheme := "http"
+	if c.TLSEnabled() {
+		scheme = "https"
+	}
+	return scheme + "://" + net.JoinHostPort(c.Address, strconv.Itoa(c.ControlPort))
 }
 
 // EffectiveKeepalive resolves the configured keepalive or the default.

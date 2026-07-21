@@ -89,11 +89,12 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request, clientID
 		self.UpdatedAt = nowRFC3339()
 		self.LastSeenAt = self.UpdatedAt
 		resp = api.RegisterResponse{
-			ID:      self.ID,
-			Name:    self.Name,
-			Address: self.Address,
-			IPRange: cc.IPRange,
-			Peers:   buildPeers(cc, self.ID),
+			ID:         self.ID,
+			Name:       self.Name,
+			Address:    self.Address,
+			IPRange:    cc.IPRange,
+			ControlURL: cc.InternalControlURL(),
+			Peers:      buildPeers(cc, self.ID),
 		}
 		return nil
 	})
@@ -161,7 +162,13 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, clientI
 				remove = append(remove, id) // gone or blacklisted
 			}
 		}
-		resp = api.HeartbeatResponse{Address: self.Address, IPRange: cc.IPRange, Add: add, Remove: remove}
+		resp = api.HeartbeatResponse{
+			Address:    self.Address,
+			IPRange:    cc.IPRange,
+			ControlURL: cc.InternalControlURL(),
+			Add:        add,
+			Remove:     remove,
+		}
 		return nil
 	})
 	if err != nil {

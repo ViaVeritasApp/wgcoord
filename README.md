@@ -42,20 +42,36 @@ off from the mesh.
    (and on demand). Blacklisting a client removes it from the hub interface and
    from every other client's config on their next heartbeat.
 
-### The control plane is out-of-band
+### The control plane bootstraps out-of-band, then moves inside the mesh
 
-**All coordinator requests happen outside the WireGuard network.** Both
-`register` and `heartbeat` travel over the client's ordinary network to the
-coordinator's **public** control endpoint (e.g. `http://203.0.113.1:51821`) —
-**not** through the mesh tunnel. This is by design: a client must reach the
-coordinator to obtain its address and peer set *before* any tunnel exists, and
-it keeps heartbeating over that same public URL afterwards. The data plane (mesh
-UDP) and the control plane (HTTP) are entirely separate paths.
+A client must reach the coordinator to obtain its address and peer set *before*
+any tunnel exists, so **`register` always travels over the client's ordinary
+network** to the coordinator's public control endpoint (e.g.
+`http://203.0.113.1:51821`).
 
-The consequence: the control plane is **not** protected by WireGuard's
-encryption, yet it carries bearer tokens and public keys. In any real deployment
-run it over HTTPS — either with the built-in TLS flags or, preferably, behind a
-reverse proxy (see [HTTPS / reverse proxy](#https--reverse-proxy)).
+Once the tunnel is up, that changes. Every response carries the coordinator's
+**in-mesh** control URL (`control_url`, e.g. `http://10.8.0.1:51821` — the hub's
+own mesh address on the control port), and subsequent heartbeats prefer it, so
+the bearer token and public keys ride inside WireGuard's encryption:
+
+- The mesh path is used only when the client has a mesh address, holds the
+  coordinator peer, is on a host that can bring the interface up, and the
+  advertised URL is inside the mesh range.
+- **Any transport failure falls back to the public URL** — a dial error,
+  timeout, or 5xx. The client then sticks to the public URL for 5 minutes
+  before trying the mesh again, so a broken tunnel costs one short stall rather
+  than slowing every beat. A definitive answer from the coordinator (`401`,
+  `403`, …) is *not* retried: it proves the mesh path works.
+- A coordinator that advertises no `control_url` (or a client that never
+  applies a tunnel) simply keeps using the public URL, exactly as before.
+
+The consequence for bootstrap: `register` — the one request that carries the
+join token before any tunnel exists — is **not** protected by WireGuard's
+encryption. In any real deployment run the control plane over HTTPS too, either
+with the built-in TLS flags or, preferably, behind a reverse proxy (see
+[HTTPS / reverse proxy](#https--reverse-proxy)). When the coordinator terminates
+TLS itself, the advertised in-mesh URL is `https://` on the mesh address, so the
+certificate must cover it — otherwise clients simply fall back to the public URL.
 
 ## Build & install
 

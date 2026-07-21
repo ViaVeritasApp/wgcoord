@@ -147,7 +147,11 @@ func clientStatusCmd() *cobra.Command {
 				return err
 			}
 			fmt.Printf("Client %q  %s\n", cc.Name, config.Path())
-			fmt.Printf("  coordinator %s\n", cc.CoordinatorURL)
+			coord := cc.CoordinatorURL + " (public)"
+			if cc.InternalURL != "" {
+				coord += ", " + cc.InternalURL + " (mesh, preferred)"
+			}
+			fmt.Printf("  coordinator %s\n", coord)
 			fmt.Printf("  interface %s (udp/%d), address %s\n", cc.Interface, cc.ListenPort, orStr(cc.Address, "-"))
 			fmt.Printf("  public key %s\n", cc.PublicKey)
 			if cc.PublicEndpoint != "" {
