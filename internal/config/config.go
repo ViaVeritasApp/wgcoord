@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"time"
+
+	"wgcoord/internal/valid"
 )
 
 // Mode values.
@@ -96,7 +98,8 @@ type ClientConfig struct {
 	IPRange          string `json:"ip_range,omitempty"` // mesh CIDR, for the interface netmask
 	Keepalive        int    `json:"persistent_keepalive,omitempty"`
 	HeartbeatSeconds int    `json:"heartbeat_seconds,omitempty"`
-	Peers            []Peer `json:"peers"`
+	EndpointOverrides map[string]string `json:"endpoint_overrides,omitempty"`
+	Peers             []Peer            `json:"peers"`
 }
 
 // Peer is one other mesh member as cached on a client.
@@ -106,6 +109,59 @@ type Peer struct {
 	PublicKey  string `json:"public_key"`
 	Endpoint   string `json:"endpoint,omitempty"`
 	AllowedIPs string `json:"allowed_ips"`
+}
+
+// EndpointOverrideFor returns the override configured for p, matched on its id
+// first and then its name.
+func (c *ClientConfig) EndpointOverrideFor(p Peer) (string, bool) {
+	if len(c.EndpointOverrides) == 0 {
+		return "", false
+	}
+	if v, ok := c.EndpointOverrides[p.ID]; ok {
+		return v, true
+	}
+	v, ok := c.EndpointOverrides[p.Name]
+	return v, ok
+}
+
+// ResolveEndpoint is the endpoint to program for p: the local override when one
+// is set, otherwise what the coordinator advertised. A bare-host override keeps
+// the advertised port, so pinning a peer to a LAN address doesn't silently move
+// it off the port it actually listens on.
+func (c *ClientConfig) ResolveEndpoint(p Peer) string {
+	ov, ok := c.EndpointOverrideFor(p)
+	if !ok {
+		return p.Endpoint
+	}
+	if ov == valid.EndpointNone {
+		return ""
+	}
+	if _, _, err := net.SplitHostPort(ov); err == nil {
+		return ov // already host:port
+	}
+	return net.JoinHostPort(ov, strconv.Itoa(advertisedPort(p.Endpoint)))
+}
+
+// KnownPeer reports whether key names a peer this client currently holds, by id
+// or name — used to warn about an override that matches nothing.
+func (c *ClientConfig) KnownPeer(key string) bool {
+	for _, p := range c.Peers {
+		if p.ID == key || p.Name == key {
+			return true
+		}
+	}
+	return false
+}
+
+// advertisedPort extracts the port from a coordinator-advertised endpoint,
+// falling back to the default when the peer advertised none (roaming/NAT).
+func advertisedPort(endpoint string) int {
+	if _, p, err := net.SplitHostPort(endpoint); err == nil {
+		if n, err := strconv.Atoi(p); err == nil && n > 0 {
+			return n
+		}
+	}
+	return DefaultClientWGPort
 }
 
 // TLSEnabled reports whether the control plane serves HTTPS itself, as opposed

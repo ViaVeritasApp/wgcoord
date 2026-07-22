@@ -20,6 +20,7 @@ import (
 	"wgcoord/internal/api"
 	"wgcoord/internal/config"
 	"wgcoord/internal/ipalloc"
+	"wgcoord/internal/valid"
 	"wgcoord/internal/wgctl"
 	"wgcoord/internal/wgkey"
 )
@@ -51,15 +52,16 @@ var meshAvailable = wgctl.Available
 
 // JoinOptions configures a first-time join.
 type JoinOptions struct {
-	CoordinatorURL   string
-	Token            string
-	Name             string
-	Interface        string
-	ListenPort       int
-	PublicEndpoint   string
-	RequestedAddress string
-	Keepalive        int
-	HeartbeatSeconds int
+	CoordinatorURL    string
+	Token             string
+	Name              string
+	Interface         string
+	ListenPort        int
+	PublicEndpoint    string
+	RequestedAddress  string
+	Keepalive         int
+	HeartbeatSeconds  int
+	EndpointOverrides map[string]string
 }
 
 // Join generates a keypair, registers, and persists the client config with the
@@ -76,15 +78,16 @@ func Join(o JoinOptions) (*config.ClientConfig, error) {
 		return nil, err
 	}
 	cc := &config.ClientConfig{
-		CoordinatorURL:   strings.TrimRight(o.CoordinatorURL, "/"),
-		Token:            o.Token,
-		Interface:        orStr(o.Interface, "wg0"),
-		ListenPort:       orInt(o.ListenPort, config.DefaultClientWGPort),
-		PublicEndpoint:   o.PublicEndpoint,
-		PrivateKey:       kp.PrivateKey,
-		PublicKey:        kp.PublicKey,
-		Keepalive:        o.Keepalive,
-		HeartbeatSeconds: o.HeartbeatSeconds,
+		CoordinatorURL:    strings.TrimRight(o.CoordinatorURL, "/"),
+		Token:             o.Token,
+		Interface:         orStr(o.Interface, "wg0"),
+		ListenPort:        orInt(o.ListenPort, config.DefaultClientWGPort),
+		PublicEndpoint:    o.PublicEndpoint,
+		PrivateKey:        kp.PrivateKey,
+		PublicKey:         kp.PublicKey,
+		Keepalive:         o.Keepalive,
+		HeartbeatSeconds:  o.HeartbeatSeconds,
+		EndpointOverrides: o.EndpointOverrides,
 	}
 	resp, err := register(cc, o.RequestedAddress)
 	if err != nil {
@@ -179,6 +182,52 @@ func Down() error {
 	return wgctl.Down(cc.Interface)
 }
 
+// SetEndpointOverride pins the endpoint this node dials for a peer and persists
+// it. The coordinator is never told: an override describes how *this* node
+// reaches the peer from where it sits, which is what a peer behind the same NAT
+// needs when the router won't hairpin its own public address.
+func SetEndpointOverride(peer, endpoint string) (*config.ClientConfig, error) {
+	peer = strings.TrimSpace(peer)
+	if peer == "" {
+		return nil, fmt.Errorf("a peer name or id is required")
+	}
+	if err := valid.EndpointOverride(endpoint); err != nil {
+		return nil, err
+	}
+	_, cc, err := config.LoadClient()
+	if err != nil {
+		return nil, err
+	}
+	if cc.EndpointOverrides == nil {
+		cc.EndpointOverrides = make(map[string]string, 1)
+	}
+	cc.EndpointOverrides[peer] = endpoint
+	if err := save(cc); err != nil {
+		return nil, err
+	}
+	return cc, nil
+}
+
+// ClearEndpointOverride drops an override, restoring the coordinator-advertised
+// endpoint on the next apply.
+func ClearEndpointOverride(peer string) (*config.ClientConfig, error) {
+	_, cc, err := config.LoadClient()
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := cc.EndpointOverrides[peer]; !ok {
+		return nil, fmt.Errorf("no endpoint override set for %q", peer)
+	}
+	delete(cc.EndpointOverrides, peer)
+	if len(cc.EndpointOverrides) == 0 {
+		cc.EndpointOverrides = nil
+	}
+	if err := save(cc); err != nil {
+		return nil, err
+	}
+	return cc, nil
+}
+
 // Apply renders the interface (self + cached peers), writes the .conf, and
 // applies it live. The path is always written; err may be wgctl.ErrUnsupported.
 func Apply(cc *config.ClientConfig) (string, error) {
@@ -195,9 +244,11 @@ func Apply(cc *config.ClientConfig) (string, error) {
 		Address:    fmt.Sprintf("%s/%d", cc.Address, bits),
 	}
 	for _, p := range cc.Peers {
+		// Resolved at render time, not stored on the peer: a heartbeat delta
+		// overwrites cached peers wholesale, and the override must survive that.
 		iface.Peers = append(iface.Peers, wgctl.Peer{
 			PublicKey:  p.PublicKey,
-			Endpoint:   p.Endpoint,
+			Endpoint:   cc.ResolveEndpoint(p),
 			AllowedIPs: []string{p.AllowedIPs},
 			Keepalive:  cc.EffectiveKeepalive(),
 		})
