@@ -116,6 +116,24 @@ func TestPostDoesNotRetryClientError(t *testing.T) {
 	}
 }
 
+// A heartbeat replaces cached peers wholesale, so the override — which lives on
+// the config, not the peer — must still be the address that gets programmed.
+func TestEndpointOverrideSurvivesHeartbeatDelta(t *testing.T) {
+	cc := &config.ClientConfig{
+		EndpointOverrides: map[string]string{"server-a": "192.168.1.50"},
+		Peers:             []config.Peer{{ID: "abc123", Name: "server-a", Endpoint: "203.0.113.20:51820"}},
+	}
+	applyDelta(cc, &api.HeartbeatResponse{
+		Add: []api.Peer{{ID: "abc123", Name: "server-a", Endpoint: "198.51.100.9:51820"}},
+	})
+	if got := cc.Peers[0].Endpoint; got != "198.51.100.9:51820" {
+		t.Fatalf("cached endpoint not refreshed from the hub: %q", got)
+	}
+	if got := cc.ResolveEndpoint(cc.Peers[0]); got != "192.168.1.50:51820" {
+		t.Fatalf("override lost after delta: got %q", got)
+	}
+}
+
 func TestInternalBaseGating(t *testing.T) {
 	tests := []struct {
 		name   string

@@ -46,6 +46,39 @@ func TestEndpointHostTooLong(t *testing.T) {
 	}
 }
 
+func TestEndpointOverride(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		ok   bool
+	}{
+		{"bare lan ip", "192.168.1.50", true},
+		{"host and port", "192.168.1.50:51820", true},
+		{"hostname", "pve-node2.lan", true},
+		{"bracketed ipv6 with port", "[2001:db8::1]:51820", true},
+		{"bare ipv6", "2001:db8::1", true},
+		{"suppress endpoint", "-", true},
+		{"empty", "", false},
+		{"port zero", "192.168.1.50:0", false},
+		{"port out of range", "192.168.1.50:70000", false},
+		{"non-numeric port", "192.168.1.50:wg", false},
+		{"unbracketed ipv6 with port", "2001:db8::1:51820", false}, // ambiguous; reads as a bare v6
+		{"newline injection", "192.168.1.50\nEndpoint = evil", false},
+		{"space", "192.168.1.50 evil", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := EndpointOverride(c.in)
+			if c.ok && err != nil {
+				t.Errorf("EndpointOverride(%q) = %v; want nil", c.in, err)
+			}
+			if !c.ok && err == nil {
+				t.Errorf("EndpointOverride(%q) = nil; want error", c.in)
+			}
+		})
+	}
+}
+
 func TestInterfaceName(t *testing.T) {
 	cases := []struct {
 		name string

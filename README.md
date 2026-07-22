@@ -161,6 +161,9 @@ Join a coordinator and keep this node's interface in sync.
 | `client up` | Apply the cached peer set to the interface (no coordinator call). | `wgcoord client up` |
 | `client down` | Tear down the WireGuard interface. | `wgcoord client down` |
 | `client status` | Show this node's identity and its peers. | `wgcoord client status` |
+| `client endpoint set <peer> <host[:port]>` | Pin the address **this** node dials for a peer, overriding the coordinator (`-` drops the endpoint). | `wgcoord client endpoint set coordinator 192.168.1.10` |
+| `client endpoint clear <peer>` | Drop the override and go back to the advertised endpoint (aliases `unset`, `rm`). | `wgcoord client endpoint clear coordinator` |
+| `client endpoint list` | Show this node's overrides (alias `ls`). | `wgcoord client endpoint list` |
 
 **`client join` flags**
 
@@ -174,6 +177,7 @@ Join a coordinator and keep this node's interface in sync.
 | `--wg-port` | `51820` | Local WireGuard UDP port. |
 | `--keepalive` | `25` | Persistent-keepalive seconds toward peers. |
 | `--heartbeat` | `25` | Heartbeat interval seconds. |
+| `--peer-endpoint` | (none) | Dial a peer at a different address than the coordinator advertises: `<peer>=<host[:port]>`. Repeatable. |
 
 A client behind NAT can omit `--public-ip`; it still reaches peers by dialing
 out and is kept reachable by persistent-keepalive:
@@ -184,6 +188,43 @@ wgcoord client join \
   --token <TOKEN>
 wgcoord client run
 ```
+
+### Endpoint overrides (NAT hairpin, split LANs)
+
+The coordinator advertises one endpoint per peer — the public address that peer
+reported — and that is the right answer only from *outside*. Two nodes behind
+the same NAT that dial each other's public IP depend on the router hairpinning
+its own WAN address back inside; many (Proxmox hosts behind a consumer router,
+most cloud NAT gateways) simply drop it, and the handshake never completes.
+
+An override pins the address **this** node uses for a given peer. It is local,
+never sent to the coordinator, and re-applied on every sync — so a heartbeat
+that refreshes the peer's public endpoint doesn't undo it. Note that `--server`
+alone is not enough: pointing the control plane at a LAN address moves only
+register/heartbeat, not the tunnel.
+
+```bash
+# at join time — before the first apply, so the tunnel never uses the public IP
+wgcoord client join --server http://192.168.1.10:51821 --token <TOKEN> \
+  --peer-endpoint coordinator=192.168.1.10 \
+  --peer-endpoint server-b=192.168.1.51:51820
+
+# or any time afterwards; both re-apply the interface immediately
+wgcoord client endpoint set coordinator 192.168.1.10
+wgcoord client endpoint list
+wgcoord client endpoint clear coordinator
+```
+
+- A peer is named by its **name** or its **id** (the hub is `coordinator`). An
+  override for a peer that doesn't exist yet is kept and applies when it joins.
+- A **bare host** keeps the port the coordinator advertised, so pinning a LAN
+  address can't silently move a peer off the port it listens on. Give
+  `host:port` to set both; bracket IPv6 when you include a port
+  (`[2001:db8::1]:51820`).
+- `-` removes the endpoint entirely, leaving that peer dial-out-only.
+- **Usually only one side needs it.** WireGuard learns a peer's endpoint from
+  its authenticated handshakes, so once the LAN-side node dials out correctly,
+  the other end picks up the working source address on its own.
 
 **Global flag:** `--config <path>` (available on every command) overrides the
 config location; `$WGCOORD_CONFIG` does the same. See

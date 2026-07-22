@@ -5,9 +5,16 @@ package valid
 
 import (
 	"fmt"
+	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 )
+
+// EndpointNone is the endpoint-override value meaning "program no endpoint at
+// all", leaving the peer dial-out-only: WireGuard then learns its address from
+// the peer's own handshake instead of a configured one.
+const EndpointNone = "-"
 
 // EndpointHost validates a bare host/IP for a WireGuard Endpoint. IP literals
 // (v4/v6) are accepted as-is; otherwise only DNS hostname characters are
@@ -30,6 +37,24 @@ func EndpointHost(h string) error {
 		return fmt.Errorf("invalid endpoint host %q", h)
 	}
 	return nil
+}
+
+// EndpointOverride validates a locally-pinned peer endpoint: a bare host (the
+// advertised port is kept), an explicit host:port, or EndpointNone. IPv6 with a
+// port must be bracketed, exactly as WireGuard wants it.
+func EndpointOverride(v string) error {
+	if v == EndpointNone {
+		return nil
+	}
+	host := v
+	if h, p, err := net.SplitHostPort(v); err == nil {
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("invalid endpoint port %q", p)
+		}
+		host = h
+	}
+	return EndpointHost(host)
 }
 
 // InterfaceName validates a WireGuard/Linux interface name: 1-15 chars, no path
