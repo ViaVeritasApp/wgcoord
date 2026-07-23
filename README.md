@@ -107,6 +107,9 @@ config lives in `/etc/wgcoord/`.
 | `coordinator client add <name>` | Create a named client and print its one-time token + join command. | `wgcoord coordinator client add laptop` |
 | `coordinator client remove <name>` | Delete a client from the registry (aliases `rm`, `delete`). | `wgcoord coordinator client remove laptop` |
 | `coordinator client rename <old> <new>` | Rename a client. | `wgcoord coordinator client rename laptop workstation` |
+| `coordinator route add <node> <cidr>…` | Advertise extra CIDRs a node carries (pod subnets, LANs) in its AllowedIPs. `<node>` is a client name or `coordinator`. | `wgcoord coordinator route add node1 10.12.1.0/24` |
+| `coordinator route remove <node> <cidr>…` | Drop advertised routes from a node (aliases `rm`, `delete`). | `wgcoord coordinator route remove node1 10.12.1.0/24` |
+| `coordinator route list [<node>]` | Show a node's routes, or every node's when omitted. | `wgcoord coordinator route list` |
 | `coordinator token regenerate <name>` | Rotate a client's token; the old one stops working immediately (aliases `regen`, `new`). | `wgcoord coordinator token regenerate laptop` |
 | `coordinator blacklist <name>` | Block a client — refused at the control plane and dropped from the hub. | `wgcoord coordinator blacklist laptop` |
 | `coordinator blacklist remove <name>` | Lift the blacklist; the client may rejoin on its next heartbeat. | `wgcoord coordinator blacklist remove laptop` |
@@ -127,6 +130,7 @@ The `coordinator` command also accepts the alias `coord`.
 | `--interface` | `wg0` | WireGuard interface name. |
 | `--tls-cert` | (none) | TLS certificate file for the control plane (enables HTTPS directly). |
 | `--tls-key` | (none) | TLS private key file for the control plane (enables HTTPS directly). |
+| `--route` | (none) | Extra CIDR the hub carries, added to its advertised AllowedIPs (e.g. its pod subnet). Repeatable. See [Routing extra subnets](#routing-extra-subnets-kubernetes-pods-lans). |
 | `--force` | `false` | Overwrite an existing config. |
 
 **`coordinator client add` flags**
@@ -134,6 +138,7 @@ The `coordinator` command also accepts the alias `coord`.
 | Flag | Default | Description |
 |---|---|---|
 | `--address` | auto | Assign a specific mesh IP; otherwise the lowest free host is allocated. |
+| `--route` | (none) | Extra CIDR this client carries, added to its advertised AllowedIPs (e.g. its pod subnet). Repeatable. See [Routing extra subnets](#routing-extra-subnets-kubernetes-pods-lans). |
 
 Example — initialize the hub, add a client with a pinned IP, then run:
 
@@ -229,6 +234,47 @@ wgcoord client endpoint clear coordinator
 **Global flag:** `--config <path>` (available on every command) overrides the
 config location; `$WGCOORD_CONFIG` does the same. See
 [Configuration file](#configuration-file).
+
+## Routing extra subnets (Kubernetes pods, LANs)
+
+By default each peer's `AllowedIPs` is just its own mesh address as a `/32`, so
+only node-to-node traffic on the mesh range crosses the tunnel. WireGuard's
+`AllowedIPs` is also a firewall: a packet whose source or destination falls
+outside a peer's `AllowedIPs` is **dropped before it leaves the interface**. So
+if a node sits in front of another subnet — a Kubernetes pod CIDR, a LAN behind
+it — that subnet's packets are silently discarded until the subnet is added to
+the AllowedIPs on **every** peer.
+
+**Routes** are the extra CIDRs a node carries. A route on `node1` is appended to
+the AllowedIPs advertised for `node1` to every other peer (and to the hub's own
+interface), so the mesh sends that subnet through `node1`'s tunnel. Routes are
+**set on the coordinator** — the hub is the source of truth for who may carry
+what — and propagate to every peer on its next heartbeat; nothing is hand-edited
+on the nodes (and manual `wg0.conf` edits wouldn't survive the next reconcile
+anyway). `<node>` is a client name, or `coordinator` for the hub itself.
+
+```bash
+# each node advertises only its own pod CIDR — not a blanket cluster CIDR, so
+# WireGuard's cryptokey routing stays unambiguous about which peer owns which pod
+wgcoord coordinator route add coordinator 10.12.0.0/24   # the hub's / master's pod subnet
+wgcoord coordinator route add node1       10.12.1.0/24   # node1's pod subnet
+wgcoord coordinator route add node2       10.12.2.0/24
+wgcoord coordinator route list                           # every node's routes
+```
+
+Equivalently, set them when the node is created: `coordinator init --route
+10.12.0.0/24` for the hub, `coordinator client add node1 --route 10.12.1.0/24`.
+
+- **One CIDR per owning node**, not one shared cluster CIDR on all of them.
+  `AllowedIPs` doubles as WireGuard's routing table, and it must map each
+  destination to exactly one peer — so give each node the pod subnet *it* owns.
+- CIDRs are validated and normalized to their network form (`10.12.1.5/24` →
+  `10.12.1.0/24`); a single host needs an explicit `/32`.
+- **wgcoord only manages WireGuard's cryptokey routing (AllowedIPs).** The
+  kernel still needs a route pointing the CIDR at the interface. In a Kubernetes
+  cluster the CNI installs those routes (Flannel/Calico point each pod CIDR at
+  the owning node's mesh IP); for a plain LAN behind a node, add the `ip route`
+  yourself.
 
 ## Running as a service (systemd)
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -25,6 +26,7 @@ func coordinatorCmd() *cobra.Command {
 		coordInitCmd(),
 		coordRunCmd(),
 		coordClientCmd(),
+		coordRouteCmd(),
 		coordTokenCmd(),
 		coordBlacklistCmd(),
 		coordStatusCmd(),
@@ -35,6 +37,7 @@ func coordinatorCmd() *cobra.Command {
 func coordInitCmd() *cobra.Command {
 	var controlPort, wgPort, clientWGPort int
 	var iface, ipRange, address, publicIP, tlsCert, tlsKey string
+	var routes []string
 	var force bool
 	c := &cobra.Command{
 		Use:   "init",
@@ -51,6 +54,10 @@ func coordInitCmd() *cobra.Command {
 				if err := valid.EndpointHost(publicIP); err != nil {
 					return err
 				}
+			}
+			canonRoutes, err := canonicalRoutes(routes)
+			if err != nil {
+				return err
 			}
 			ipRange = orStr(ipRange, config.DefaultIPRange)
 			if address == "" {
@@ -80,6 +87,7 @@ func coordInitCmd() *cobra.Command {
 				PublicKey:      kp.PublicKey,
 				TLSCertFile:    tlsCert,
 				TLSKeyFile:     tlsKey,
+				Routes:         canonRoutes,
 				Clients:        []*config.Client{},
 			}
 			if err := config.Save(&config.Config{Mode: config.ModeCoordinator, Coordinator: cc}); err != nil {
@@ -89,6 +97,9 @@ func coordInitCmd() *cobra.Command {
 			fmt.Printf("  interface:    %s (udp/%d)\n", cc.Interface, cc.ListenPort)
 			fmt.Printf("  control port: tcp/%d\n", cc.ControlPort)
 			fmt.Printf("  mesh range:   %s (hub %s)\n", cc.IPRange, cc.Address)
+			if len(cc.Routes) > 0 {
+				fmt.Printf("  routes:       %s\n", strings.Join(cc.Routes, ", "))
+			}
 			fmt.Printf("  public key:   %s\n", cc.PublicKey)
 			if publicIP == "" {
 				fmt.Println("\n⚠  No --public-ip set: clients can't dial this hub until you provide one (re-run with --force, or edit config).")
@@ -108,6 +119,7 @@ func coordInitCmd() *cobra.Command {
 	c.Flags().StringVar(&publicIP, "public-ip", "", "public IP/host clients dial to reach this hub")
 	c.Flags().StringVar(&tlsCert, "tls-cert", "", "TLS certificate file for the control plane (enables HTTPS)")
 	c.Flags().StringVar(&tlsKey, "tls-key", "", "TLS private key file for the control plane (enables HTTPS)")
+	c.Flags().StringArrayVar(&routes, "route", nil, "extra CIDR the hub carries, added to its advertised AllowedIPs (e.g. a pod subnet); repeatable")
 	c.Flags().BoolVar(&force, "force", false, "overwrite an existing config")
 	return c
 }
@@ -136,12 +148,13 @@ func coordClientCmd() *cobra.Command {
 
 func coordClientAddCmd() *cobra.Command {
 	var address string
+	var routes []string
 	c := &cobra.Command{
 		Use:   "add <name>",
 		Args:  cobra.ExactArgs(1),
 		Short: "Create a named client and print its one-time auth token",
 		RunE: func(_ *cobra.Command, args []string) error {
-			cl, tok, err := coordinator.NewStore().AddClient(args[0], address)
+			cl, tok, err := coordinator.NewStore().AddClient(args[0], address, routes)
 			if err != nil {
 				return err
 			}
@@ -149,6 +162,9 @@ func coordClientAddCmd() *cobra.Command {
 			fmt.Printf("Client %q created\n", cl.Name)
 			fmt.Printf("  id:      %s\n", cl.ID)
 			fmt.Printf("  address: %s\n", cl.Address)
+			if len(cl.Routes) > 0 {
+				fmt.Printf("  routes:  %s\n", strings.Join(cl.Routes, ", "))
+			}
 			fmt.Printf("  token:   %s\n", tok)
 			fmt.Println("\nOn the client machine run:")
 			fmt.Printf("  wgcoord client join --server %s --token %s\n", coordinatorURLHint(cc), tok)
@@ -157,6 +173,7 @@ func coordClientAddCmd() *cobra.Command {
 		},
 	}
 	c.Flags().StringVar(&address, "address", "", "assign a specific mesh IP (default: auto-allocate lowest free)")
+	c.Flags().StringArrayVar(&routes, "route", nil, "extra CIDR this client carries, added to its advertised AllowedIPs (e.g. a pod subnet); repeatable")
 	return c
 }
 
@@ -189,6 +206,103 @@ func coordClientRenameCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+// coordRouteCmd manages the extra CIDRs a node carries beyond its mesh /32.
+// Those routes are appended to the AllowedIPs advertised for the node, so peers
+// route the subnets (Kubernetes pod CIDRs, LANs behind a node) through its
+// tunnel instead of WireGuard's cryptokey routing dropping them. <node> is a
+// client name, or "coordinator" for the hub itself.
+func coordRouteCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "route",
+		Short: "Manage extra routes (AllowedIPs) a node advertises, e.g. Kubernetes pod CIDRs",
+		Long: "Manage the extra CIDRs a node carries beyond its own mesh address. Each is\n" +
+			"appended to the AllowedIPs advertised for that node, so peers send the subnet\n" +
+			"through its tunnel. Use this to let Kubernetes pod traffic (or any subnet\n" +
+			"behind a node) cross the mesh. <node> is a client name, or \"coordinator\" for\n" +
+			"the hub. Changes reach every peer on its next heartbeat (≤ the beat interval).",
+	}
+	cmd.AddCommand(coordRouteAddCmd(), coordRouteRemoveCmd(), coordRouteListCmd())
+	return cmd
+}
+
+func coordRouteAddCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "add <node> <cidr> [<cidr>...]",
+		Short: "Add one or more routes to a node's advertised AllowedIPs",
+		Args:  cobra.MinimumNArgs(2),
+		RunE: func(_ *cobra.Command, args []string) error {
+			added, err := coordinator.NewStore().AddRoutes(args[0], args[1:])
+			if err != nil {
+				return err
+			}
+			if len(added) == 0 {
+				fmt.Printf("No new routes for %q (already present).\n", args[0])
+				return nil
+			}
+			fmt.Printf("Added to %q: %s\n", args[0], strings.Join(added, ", "))
+			fmt.Println("Peers pick this up on their next heartbeat.")
+			return nil
+		},
+	}
+}
+
+func coordRouteRemoveCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:     "remove <node> <cidr> [<cidr>...]",
+		Aliases: []string{"rm", "delete"},
+		Short:   "Remove one or more routes from a node's advertised AllowedIPs",
+		Args:    cobra.MinimumNArgs(2),
+		RunE: func(_ *cobra.Command, args []string) error {
+			removed, err := coordinator.NewStore().RemoveRoutes(args[0], args[1:])
+			if err != nil {
+				return err
+			}
+			if len(removed) == 0 {
+				fmt.Printf("No matching routes on %q.\n", args[0])
+				return nil
+			}
+			fmt.Printf("Removed from %q: %s\n", args[0], strings.Join(removed, ", "))
+			fmt.Println("Peers drop it on their next heartbeat.")
+			return nil
+		},
+	}
+}
+
+func coordRouteListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "list [<node>]",
+		Short: "List routes for a node, or every node when omitted",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			if len(args) == 1 {
+				routes, name, err := coordinator.NewStore().Routes(args[0])
+				if err != nil {
+					return err
+				}
+				printRoutes(name, routes)
+				return nil
+			}
+			_, cc, err := config.LoadCoordinator()
+			if err != nil {
+				return err
+			}
+			printRoutes("coordinator", cc.Routes)
+			for _, cl := range cc.Clients {
+				printRoutes(cl.Name, cl.Routes)
+			}
+			return nil
+		},
+	}
+}
+
+func printRoutes(name string, routes []string) {
+	if len(routes) == 0 {
+		fmt.Printf("%s: (none)\n", name)
+		return
+	}
+	fmt.Printf("%s: %s\n", name, strings.Join(routes, ", "))
 }
 
 func coordTokenCmd() *cobra.Command {
@@ -251,6 +365,9 @@ func coordStatusCmd() *cobra.Command {
 			fmt.Printf("Coordinator  %s\n", config.Path())
 			fmt.Printf("  interface %s (udp/%d), control tcp/%d\n", cc.Interface, cc.ListenPort, cc.ControlPort)
 			fmt.Printf("  range %s, hub %s\n", cc.IPRange, cc.Address)
+			if len(cc.Routes) > 0 {
+				fmt.Printf("  routes %s\n", strings.Join(cc.Routes, ", "))
+			}
 			if cc.PublicEndpoint != "" {
 				fmt.Printf("  public %s\n", net.JoinHostPort(cc.PublicEndpoint, strconv.Itoa(cc.ListenPort)))
 			}
@@ -264,10 +381,10 @@ func coordStatusCmd() *cobra.Command {
 				return nil
 			}
 			tw := tabwriter.NewWriter(cmdOut, 0, 2, 2, ' ', 0)
-			fmt.Fprintln(tw, "NAME\tADDRESS\tPUBLIC KEY\tENDPOINT\tSTATUS\tLAST SEEN")
+			fmt.Fprintln(tw, "NAME\tADDRESS\tROUTES\tPUBLIC KEY\tENDPOINT\tSTATUS\tLAST SEEN")
 			for _, cl := range cc.Clients {
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
-					cl.Name, cl.Address, shortKey(cl.PublicKey), orStr(cl.Endpoint, "-"),
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					cl.Name, cl.Address, routesCell(cl.Routes), shortKey(cl.PublicKey), orStr(cl.Endpoint, "-"),
 					clientStatus(cl), relTime(cl.LastSeenAt))
 			}
 			return tw.Flush()

@@ -79,6 +79,45 @@ func TestEndpointOverride(t *testing.T) {
 	}
 }
 
+func TestCIDR(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string // "" means an error is expected
+	}{
+		{"pod subnet", "10.12.1.0/24", "10.12.1.0/24"},
+		{"masks host bits", "10.12.1.5/24", "10.12.1.0/24"},
+		{"cluster cidr", "10.12.0.0/16", "10.12.0.0/16"},
+		{"single host /32", "10.43.206.233/32", "10.43.206.233/32"},
+		{"default route", "0.0.0.0/0", "0.0.0.0/0"},
+		{"ipv6 network", "fd00:12::/64", "fd00:12::/64"},
+		{"surrounding space trimmed", "  10.12.1.0/24 ", "10.12.1.0/24"},
+		{"bare host without mask", "10.12.1.0", ""},
+		{"empty", "", ""},
+		{"not an ip", "notacidr/24", ""},
+		{"bad mask", "10.12.1.0/33", ""},
+		{"newline injection", "10.12.1.0/24\nAllowedIPs = 0.0.0.0/0", ""},
+		{"space injection", "10.12.1.0/24 evil", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := CIDR(c.in)
+			if c.want == "" {
+				if err == nil {
+					t.Errorf("CIDR(%q) = %q, nil; want error", c.in, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("CIDR(%q) = %v; want %q", c.in, err, c.want)
+			}
+			if got != c.want {
+				t.Errorf("CIDR(%q) = %q; want %q", c.in, got, c.want)
+			}
+		})
+	}
+}
+
 func TestInterfaceName(t *testing.T) {
 	cases := []struct {
 		name string

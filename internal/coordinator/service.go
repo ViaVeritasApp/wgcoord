@@ -130,7 +130,7 @@ func desiredInterface(cc *config.CoordinatorConfig) (wgctl.Interface, error) {
 		iface.Peers = append(iface.Peers, wgctl.Peer{
 			PublicKey:  c.PublicKey,
 			Endpoint:   c.Endpoint,
-			AllowedIPs: []string{c.Address + "/32"},
+			AllowedIPs: allowedIPs(c.Address, c.Routes),
 		})
 	}
 	return iface, nil

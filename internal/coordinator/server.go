@@ -148,10 +148,17 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request, clientI
 		var add []api.Peer
 		for _, p := range peers {
 			present[p.ID] = true
-			changed := false
-			if c := findByID(cc, p.ID); c != nil && c.UpdatedAt != "" && prevSeen != "" && c.UpdatedAt > prevSeen {
-				changed = true // updated since this client last synced
+			// A peer already held by the client is only re-sent when it changed
+			// since the client last synced. The hub tracks its own UpdatedAt
+			// (bumped when its routes change); other peers track theirs on the
+			// client record.
+			updatedAt := ""
+			if p.ID == api.CoordinatorPeerID {
+				updatedAt = cc.UpdatedAt
+			} else if c := findByID(cc, p.ID); c != nil {
+				updatedAt = c.UpdatedAt
 			}
+			changed := updatedAt != "" && prevSeen != "" && updatedAt > prevSeen
 			if !have[p.ID] || changed {
 				add = append(add, p)
 			}
@@ -187,7 +194,7 @@ func buildPeers(cc *config.CoordinatorConfig, selfID string) []api.Peer {
 			ID:         api.CoordinatorPeerID,
 			Name:       "coordinator",
 			PublicKey:  cc.PublicKey,
-			AllowedIPs: cc.Address + "/32",
+			AllowedIPs: strings.Join(allowedIPs(cc.Address, cc.Routes), ", "),
 		}
 		if cc.PublicEndpoint != "" {
 			hub.Endpoint = net.JoinHostPort(cc.PublicEndpoint, strconv.Itoa(cc.ListenPort))
@@ -203,10 +210,22 @@ func buildPeers(cc *config.CoordinatorConfig, selfID string) []api.Peer {
 			Name:       c.Name,
 			PublicKey:  c.PublicKey,
 			Endpoint:   c.Endpoint,
-			AllowedIPs: c.Address + "/32",
+			AllowedIPs: strings.Join(allowedIPs(c.Address, c.Routes), ", "),
 		})
 	}
 	return peers
+}
+
+// allowedIPs is the AllowedIPs set for a mesh member: its own address as a /32
+// host route, followed by any extra routes it carries (pod CIDRs, LANs). The
+// /32 keeps each node individually addressable; the routes are what let pod and
+// subnet traffic cross the tunnel instead of being dropped by cryptokey routing.
+func allowedIPs(addr string, routes []string) []string {
+	ips := make([]string, 0, len(routes)+1)
+	if addr != "" {
+		ips = append(ips, addr+"/32")
+	}
+	return append(ips, routes...)
 }
 
 // --- small HTTP helpers ---

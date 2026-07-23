@@ -13,9 +13,11 @@ import (
 	"syscall"
 	"time"
 
+	"wgcoord/internal/api"
 	"wgcoord/internal/config"
 	"wgcoord/internal/ipalloc"
 	"wgcoord/internal/token"
+	"wgcoord/internal/valid"
 )
 
 // ErrUnauthorized is returned when a presented token matches no client.
@@ -61,12 +63,17 @@ func (s *Store) Mutate(fn func(cc *config.CoordinatorConfig) error) error {
 }
 
 // AddClient creates a named client with a fresh token. A non-empty address is
-// reserved; otherwise the lowest free one is auto-allocated. The returned
-// plaintext token is shown once and never stored.
-func (s *Store) AddClient(name, address string) (*config.Client, string, error) {
+// reserved; otherwise the lowest free one is auto-allocated. routes are extra
+// CIDRs the client carries (see AddRoutes). The returned plaintext token is
+// shown once and never stored.
+func (s *Store) AddClient(name, address string, routes []string) (*config.Client, string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return nil, "", fmt.Errorf("client name is required")
+	}
+	canonRoutes, err := canonRoutes(routes)
+	if err != nil {
+		return nil, "", err
 	}
 	tok, err := token.Generate()
 	if err != nil {
@@ -92,6 +99,7 @@ func (s *Store) AddClient(name, address string) (*config.Client, string, error) 
 			Name:      name,
 			TokenHash: token.Hash(tok),
 			Address:   addr,
+			Routes:    canonRoutes,
 			CreatedAt: nowRFC3339(),
 		}
 		cc.Clients = append(cc.Clients, c)
@@ -102,6 +110,108 @@ func (s *Store) AddClient(name, address string) (*config.Client, string, error) 
 		return nil, "", err
 	}
 	return created, tok, nil
+}
+
+// AddRoutes appends extra CIDRs a node carries — its Kubernetes pod subnet, a
+// LAN behind it — to the AllowedIPs advertised for it, so peers route those
+// subnets through its tunnel instead of WireGuard dropping them. node is a
+// client name or "coordinator" (the hub itself). Duplicates are ignored; the
+// routes actually added are returned, and the change reaches peers on their
+// next heartbeat.
+func (s *Store) AddRoutes(node string, cidrs []string) ([]string, error) {
+	canon, err := canonRoutes(cidrs)
+	if err != nil {
+		return nil, err
+	}
+	if len(canon) == 0 {
+		return nil, fmt.Errorf("at least one CIDR is required")
+	}
+	var added []string
+	err = s.Mutate(func(cc *config.CoordinatorConfig) error {
+		target, _, err := routesTarget(cc, node)
+		if err != nil {
+			return err
+		}
+		have := make(map[string]bool, len(*target))
+		for _, r := range *target {
+			have[r] = true
+		}
+		for _, r := range canon {
+			if have[r] {
+				continue
+			}
+			have[r] = true
+			*target = append(*target, r)
+			added = append(added, r)
+		}
+		if len(added) > 0 {
+			touchNode(cc, node)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return added, nil
+}
+
+// RemoveRoutes drops CIDRs from a node's advertised routes. node is a client
+// name or "coordinator". Returns the routes actually removed; the change
+// reaches peers on their next heartbeat.
+func (s *Store) RemoveRoutes(node string, cidrs []string) ([]string, error) {
+	canon, err := canonRoutes(cidrs)
+	if err != nil {
+		return nil, err
+	}
+	if len(canon) == 0 {
+		return nil, fmt.Errorf("at least one CIDR is required")
+	}
+	drop := make(map[string]bool, len(canon))
+	for _, r := range canon {
+		drop[r] = true
+	}
+	var removed []string
+	err = s.Mutate(func(cc *config.CoordinatorConfig) error {
+		target, _, err := routesTarget(cc, node)
+		if err != nil {
+			return err
+		}
+		kept := (*target)[:0]
+		for _, r := range *target {
+			if drop[r] {
+				removed = append(removed, r)
+				continue
+			}
+			kept = append(kept, r)
+		}
+		if len(kept) == 0 {
+			*target = nil
+		} else {
+			*target = kept
+		}
+		if len(removed) > 0 {
+			touchNode(cc, node)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return removed, nil
+}
+
+// Routes returns the routes configured for node (a client name or
+// "coordinator") alongside its canonical display name.
+func (s *Store) Routes(node string) ([]string, string, error) {
+	cc, err := Load()
+	if err != nil {
+		return nil, "", err
+	}
+	target, name, err := routesTarget(cc, node)
+	if err != nil {
+		return nil, "", err
+	}
+	return *target, name, nil
 }
 
 // RemoveClient deletes a client; the next reconcile drops it from the interface.
@@ -243,6 +353,60 @@ func checkAddrFree(cc *config.CoordinatorConfig, addr, exceptID string) error {
 		}
 	}
 	return nil
+}
+
+// isHub reports whether node names the coordinator itself rather than a client.
+// "coordinator" mirrors the peer id the hub advertises under; "hub" is a
+// friendlier alias.
+func isHub(node string) bool {
+	return node == api.CoordinatorPeerID || node == "hub"
+}
+
+// routesTarget resolves node (the hub, or a client by name) to the routes slice
+// to mutate and a canonical display name.
+func routesTarget(cc *config.CoordinatorConfig, node string) (*[]string, string, error) {
+	if isHub(node) {
+		return &cc.Routes, api.CoordinatorPeerID, nil
+	}
+	c := findByName(cc, node)
+	if c == nil {
+		return nil, "", notFound(node)
+	}
+	return &c.Routes, c.Name, nil
+}
+
+// touchNode bumps the UpdatedAt that drives heartbeat re-advertisement for node:
+// the hub's own timestamp, or the client record's.
+func touchNode(cc *config.CoordinatorConfig, node string) {
+	if isHub(node) {
+		cc.UpdatedAt = nowRFC3339()
+		return
+	}
+	if c := findByName(cc, node); c != nil {
+		c.UpdatedAt = nowRFC3339()
+	}
+}
+
+// canonRoutes validates and canonicalizes route CIDRs, dropping duplicates
+// while preserving order.
+func canonRoutes(cidrs []string) ([]string, error) {
+	if len(cidrs) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]bool, len(cidrs))
+	out := make([]string, 0, len(cidrs))
+	for _, c := range cidrs {
+		canon, err := valid.CIDR(c)
+		if err != nil {
+			return nil, err
+		}
+		if seen[canon] {
+			continue
+		}
+		seen[canon] = true
+		out = append(out, canon)
+	}
+	return out, nil
 }
 
 func notFound(name string) error { return fmt.Errorf("no client named %q", name) }

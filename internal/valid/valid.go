@@ -57,6 +57,21 @@ func EndpointOverride(v string) error {
 	return EndpointHost(host)
 }
 
+// CIDR validates s as an IPv4/IPv6 network in CIDR notation and returns its
+// canonical masked form (host bits cleared), e.g. "10.12.1.5/24" -> "10.12.1.0/24".
+// It backs the extra routes advertised in a peer's AllowedIPs, so the value must
+// be safe to render into a wg config: ParsePrefix rejects any whitespace,
+// control characters, or stray directives, and a bare host address (no mask) is
+// rejected so a /32 must be spelled out.
+func CIDR(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	p, err := netip.ParsePrefix(s)
+	if err != nil {
+		return "", fmt.Errorf("invalid route %q (want a CIDR like 10.12.0.0/24): %w", s, err)
+	}
+	return p.Masked().String(), nil
+}
+
 // InterfaceName validates a WireGuard/Linux interface name: 1-15 chars, no path
 // separators or other surprises.
 func InterfaceName(n string) error {
