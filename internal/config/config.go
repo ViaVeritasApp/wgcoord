@@ -56,26 +56,38 @@ type CoordinatorConfig struct {
 	Keepalive      int    `json:"persistent_keepalive,omitempty"`
 	// TLS for the control plane. When both are set the server runs HTTPS, so
 	// bearer tokens and keys aren't exposed on-path during bootstrap.
-	TLSCertFile string    `json:"tls_cert_file,omitempty"`
-	TLSKeyFile  string    `json:"tls_key_file,omitempty"`
-	Clients     []*Client `json:"clients"`
+	TLSCertFile string `json:"tls_cert_file,omitempty"`
+	TLSKeyFile  string `json:"tls_key_file,omitempty"`
+	// Routes are extra CIDRs the hub carries beyond its own mesh /32, appended
+	// to the AllowedIPs it advertises to clients (e.g. its Kubernetes pod
+	// subnet). See [Client.Routes].
+	Routes []string `json:"routes,omitempty"`
+	// UpdatedAt is bumped when the hub's own peer-facing identity changes
+	// (currently its routes), so heartbeats re-advertise the coordinator peer
+	// to clients that already hold it.
+	UpdatedAt string    `json:"updated_at,omitempty"`
+	Clients   []*Client `json:"clients"`
 }
 
 // Client is one named node as the coordinator sees it. Only the token's
 // SHA-256 hash is stored, never the plaintext.
 type Client struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	TokenHash   string   `json:"token_hash"`
-	Address     string   `json:"address"`               // assigned mesh IP (host, no mask)
-	PublicKey   string   `json:"public_key,omitempty"`  // set on first register
-	Endpoint    string   `json:"endpoint,omitempty"`    // host:port peers dial (empty until known)
-	ListenPort  int      `json:"listen_port,omitempty"` // client's own WireGuard port
-	Blacklisted bool     `json:"blacklisted"`
-	CreatedAt   string   `json:"created_at"`
-	LastSeenAt  string   `json:"last_seen_at,omitempty"`
-	UpdatedAt   string   `json:"updated_at,omitempty"` // bumped when key/endpoint/address changes
-	Have        []string `json:"have,omitempty"`       // peer ids this client last reported holding
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	TokenHash   string `json:"token_hash"`
+	Address     string `json:"address"`               // assigned mesh IP (host, no mask)
+	PublicKey   string `json:"public_key,omitempty"`  // set on first register
+	Endpoint    string `json:"endpoint,omitempty"`    // host:port peers dial (empty until known)
+	ListenPort  int    `json:"listen_port,omitempty"` // client's own WireGuard port
+	Blacklisted bool   `json:"blacklisted"`
+	CreatedAt   string `json:"created_at"`
+	LastSeenAt  string `json:"last_seen_at,omitempty"`
+	UpdatedAt   string `json:"updated_at,omitempty"` // bumped when key/endpoint/address/routes change
+	// Routes are extra CIDRs this client carries beyond its own mesh /32,
+	// appended to the AllowedIPs advertised for it so peers route those subnets
+	// through its tunnel (e.g. a Kubernetes pod CIDR, or a LAN behind the node).
+	Routes []string `json:"routes,omitempty"`
+	Have   []string `json:"have,omitempty"` // peer ids this client last reported holding
 }
 
 // ClientConfig is a client machine's state: how to reach the coordinator, its
@@ -85,19 +97,19 @@ type ClientConfig struct {
 	// InternalURL is the coordinator's control plane as reached through the
 	// mesh, advertised by the hub on register/heartbeat. Preferred once the
 	// tunnel is up; CoordinatorURL stays the fallback.
-	InternalURL      string `json:"internal_url,omitempty"`
-	Token            string `json:"token"` // plaintext auth token; the file is 0600
-	ID               string `json:"id,omitempty"`
-	Name             string `json:"name,omitempty"`
-	Interface        string `json:"interface"`
-	ListenPort       int    `json:"listen_port"`
-	PublicEndpoint   string `json:"public_endpoint,omitempty"` // this node's public IP/host, shared to peers
-	PrivateKey       string `json:"private_key"`
-	PublicKey        string `json:"public_key"`
-	Address          string `json:"address,omitempty"`  // assigned mesh IP (host, no mask)
-	IPRange          string `json:"ip_range,omitempty"` // mesh CIDR, for the interface netmask
-	Keepalive        int    `json:"persistent_keepalive,omitempty"`
-	HeartbeatSeconds int    `json:"heartbeat_seconds,omitempty"`
+	InternalURL       string            `json:"internal_url,omitempty"`
+	Token             string            `json:"token"` // plaintext auth token; the file is 0600
+	ID                string            `json:"id,omitempty"`
+	Name              string            `json:"name,omitempty"`
+	Interface         string            `json:"interface"`
+	ListenPort        int               `json:"listen_port"`
+	PublicEndpoint    string            `json:"public_endpoint,omitempty"` // this node's public IP/host, shared to peers
+	PrivateKey        string            `json:"private_key"`
+	PublicKey         string            `json:"public_key"`
+	Address           string            `json:"address,omitempty"`  // assigned mesh IP (host, no mask)
+	IPRange           string            `json:"ip_range,omitempty"` // mesh CIDR, for the interface netmask
+	Keepalive         int               `json:"persistent_keepalive,omitempty"`
+	HeartbeatSeconds  int               `json:"heartbeat_seconds,omitempty"`
 	EndpointOverrides map[string]string `json:"endpoint_overrides,omitempty"`
 	Peers             []Peer            `json:"peers"`
 }
