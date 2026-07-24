@@ -12,9 +12,11 @@ off from the mesh.
 - Two modes: `wgcoord coordinator …` and `wgcoord client …`.
 - Full mesh: the coordinator is peer‑0; every client peers with the hub **and**
   with every other client.
-- Live WireGuard apply via `wg syncconf` + `ip` (Linux + wireguard-tools). On
-  any other host apply is skipped gracefully and an inspectable `wg-quick`
-  `.conf` is written instead, so the control plane still works everywhere.
+- Live WireGuard apply on **Linux** (in-kernel WireGuard via `wg syncconf` + `ip`)
+  and **macOS** (userspace wireguard-go driven through `wg-quick`, then reconciled
+  live with `wg syncconf`). On any other host apply is skipped gracefully and an
+  inspectable `wg-quick` `.conf` is written instead, so the control plane still
+  works everywhere.
 
 ## How it works
 
@@ -82,9 +84,15 @@ make build            # -> ./wgcoord
 sudo make install     # -> /usr/local/bin/wgcoord
 ```
 
-Live apply additionally needs **wireguard-tools** (`wg`) and **iproute2** (`ip`)
-on the coordinator and each client, and root (to manage the interface). Without
-them the tool still coordinates and writes `wg0.conf` for manual
+Live apply additionally needs **wireguard-tools** (`wg`) and root (to manage the
+interface) on the coordinator and each client, plus:
+
+- **Linux** — **iproute2** (`ip`); the interface is the in-kernel WireGuard device.
+- **macOS** — **wireguard-go** and **wg-quick** (`brew install wireguard-tools
+  wireguard-go`); there is no kernel WireGuard on macOS, so the tunnel runs in
+  userspace on a `utun` device that `wg-quick` brings up.
+
+Without these the tool still coordinates and writes `wg0.conf` for a manual
 `wg-quick up`.
 
 ## Configuration file

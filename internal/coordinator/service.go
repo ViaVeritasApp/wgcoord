@@ -104,7 +104,7 @@ func (s *Service) reconcile() {
 	if err := wgctl.Apply(iface); err != nil {
 		if errors.Is(err, wgctl.ErrUnsupported) {
 			s.warnUnsupported.Do(func() {
-				s.log.Printf("live apply unavailable on this host; wrote %s — apply with `wg-quick up %s` on Linux", confPath, confPath)
+				s.log.Printf("live apply unavailable on this host; wrote %s — bring it up manually with `wg-quick up %s`", confPath, confPath)
 			})
 			return
 		}

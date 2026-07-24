@@ -111,7 +111,7 @@ func reportApply(confPath string, err error) {
 		fmt.Printf("Applied WireGuard interface (config: %s)\n", confPath)
 	case errors.Is(err, wgctl.ErrUnsupported):
 		fmt.Printf("Live apply unavailable on this host — wrote %s\n", confPath)
-		fmt.Printf("Apply it on a Linux host with: wg-quick up %s\n", confPath)
+		fmt.Printf("Bring it up manually with wireguard-tools: wg-quick up %s\n", confPath)
 	default:
 		fmt.Printf("warning: apply failed: %v (config written to %s)\n", err, confPath)
 	}
