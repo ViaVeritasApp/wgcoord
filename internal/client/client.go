@@ -149,7 +149,8 @@ func Run(ctx context.Context, logger *log.Logger) error {
 		target = fmt.Sprintf("%s (over the mesh, falling back to %s)", cc.InternalURL, cc.CoordinatorURL)
 	}
 	logger.Printf("client %q up; beating %s every %s", cc.Name, target, interval)
-	beat(logger)
+	var lastApply string
+	beat(logger, &lastApply)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -158,7 +159,7 @@ func Run(ctx context.Context, logger *log.Logger) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			beat(logger)
+			beat(logger, &lastApply)
 		}
 	}
 }
@@ -276,8 +277,10 @@ func register(cc *config.ClientConfig, requestedAddr string) (*api.RegisterRespo
 	return &resp, nil
 }
 
-// beat runs one Sync + Apply, logging transient errors rather than failing.
-func beat(logger *log.Logger) {
+// beat runs one Sync + Apply, logging transient errors rather than failing. An
+// apply fault persists across beats, so lastApply carries it and only a change
+// is logged — otherwise one broken interface fills the log every interval.
+func beat(logger *log.Logger, lastApply *string) {
 	cc, resp, err := Sync()
 	if err != nil {
 		logger.Printf("heartbeat: %v", err)
@@ -286,8 +289,17 @@ func beat(logger *log.Logger) {
 	if len(resp.Add) > 0 || len(resp.Remove) > 0 {
 		logger.Printf("peers changed: +%d -%d", len(resp.Add), len(resp.Remove))
 	}
-	if _, err := Apply(cc); err != nil && !errors.Is(err, wgctl.ErrUnsupported) {
+	_, err = Apply(cc)
+	if errors.Is(err, wgctl.ErrUnsupported) {
+		err = nil // Control plane only on this host, not a fault.
+	}
+	switch {
+	case err == nil && *lastApply != "":
+		logger.Print("apply: recovered")
+		*lastApply = ""
+	case err != nil && err.Error() != *lastApply:
 		logger.Printf("apply: %v", err)
+		*lastApply = err.Error()
 	}
 }
 

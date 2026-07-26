@@ -17,9 +17,13 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"wgcoord/internal/config"
 )
+
+// wgRunDir holds userspace tunnel sockets and wg-quick's name mapping (var for tests).
+var wgRunDir = "/var/run/wireguard"
 
 // ErrUnsupported means live apply isn't possible on this host (sentinel for errors.Is).
 var ErrUnsupported = errors.New("live WireGuard apply unavailable (needs Linux with wireguard-tools `wg` + iproute2 `ip`, or macOS with wireguard-tools `wg` + `wg-quick`)")
@@ -85,7 +89,7 @@ func applyLinux(iface Interface) error {
 			return fmt.Errorf("create interface %s: %w", iface.Name, err)
 		}
 	}
-	if err := wgSyncconf(iface); err != nil {
+	if err := wgSyncconf(iface.Name, iface); err != nil {
 		return err
 	}
 	if iface.Address != "" {
@@ -114,20 +118,21 @@ func applyDarwin(iface Interface) error {
 	if err := WriteConfigFile(confPath, iface); err != nil {
 		return err
 	}
-	if !wgInterfaceUp(iface.Name) {
+	dev, up := realInterface(iface.Name)
+	if !up {
 		if err := run("wg-quick", "up", confPath); err != nil {
 			return fmt.Errorf("wg-quick up %s: %w", confPath, err)
 		}
 		return nil
 	}
-	return wgSyncconf(iface)
+	return wgSyncconf(dev, iface)
 }
 
 // wgSyncconf makes the live interface's peer set exactly match iface via
-// `wg syncconf`. The stripped config (no Address line — that is applied
-// separately) is written 0600 into the config dir, not world-traversable /tmp,
-// because it briefly contains the interface's private key.
-func wgSyncconf(iface Interface) error {
+// `wg syncconf`, on dev (see realInterface). The stripped config (no Address
+// line — that is applied separately) is written 0600 into the config dir, not
+// world-traversable /tmp, because it briefly contains the private key.
+func wgSyncconf(dev string, iface Interface) error {
 	tmp, err := os.CreateTemp(config.Dir(), ".wgsync-*.conf")
 	if err != nil {
 		return err
@@ -145,8 +150,8 @@ func wgSyncconf(iface Interface) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := run("wg", "syncconf", iface.Name, tmpName); err != nil {
-		return fmt.Errorf("wg syncconf %s: %w", iface.Name, err)
+	if err := run("wg", "syncconf", dev, tmpName); err != nil {
+		return fmt.Errorf("wg syncconf %s: %w", dev, err)
 	}
 	return nil
 }
@@ -156,7 +161,11 @@ func RemovePeer(ifaceName, publicKey string) error {
 	if !Available() {
 		return ErrUnsupported
 	}
-	return run("wg", "set", ifaceName, "peer", publicKey, "remove")
+	dev, up := realInterface(ifaceName)
+	if !up {
+		return fmt.Errorf("remove peer from %s: interface is not up", ifaceName)
+	}
+	return run("wg", "set", dev, "peer", publicKey, "remove")
 }
 
 // Down removes the interface entirely.
@@ -171,7 +180,7 @@ func Down(ifaceName string) error {
 		}
 		return run("ip", "link", "del", "dev", ifaceName)
 	case "darwin":
-		if !wgInterfaceUp(ifaceName) {
+		if _, up := realInterface(ifaceName); !up {
 			return nil
 		}
 		confPath := wgQuickConfPath(ifaceName)
@@ -257,11 +266,43 @@ func wgQuickConfPath(name string) string {
 	return filepath.Join(config.Dir(), name+".conf")
 }
 
-// wgInterfaceUp reports whether a WireGuard interface is currently present.
-// `wg show <name>` resolves the name (via the mapping wg-quick records on macOS)
-// and exits non-zero when the interface is absent.
-func wgInterfaceUp(name string) bool {
-	return exec.Command("wg", "show", name).Run() == nil
+// realInterface resolves a configured name to the device `wg` addresses, and
+// reports whether it is up. Same name on Linux (in-kernel device); on macOS the
+// tunnel is a utun that `wg` knows only by its socket, so `wg show wg0` fails
+// even while wg0 is up and every `wg` call must use the resolved utun.
+func realInterface(name string) (string, bool) {
+	if runtime.GOOS == "darwin" {
+		return resolveUserspace(name)
+	}
+	return name, linkExists(name)
+}
+
+// resolveUserspace reads wg-quick's wg0→utunN mapping, mirroring its own
+// get_real_interface. The mtime check rejects a mapping left behind by a dead
+// tunnel whose utun another tunnel has since claimed — syncconf'ing that one
+// would overwrite a foreign tunnel's key and peers.
+func resolveUserspace(name string) (string, bool) {
+	nameFile := filepath.Join(wgRunDir, name+".name")
+	raw, err := os.ReadFile(nameFile)
+	if err != nil {
+		return "", false
+	}
+	dev := strings.TrimSpace(string(raw))
+	if dev == "" || strings.ContainsRune(dev, '/') {
+		return "", false
+	}
+	sock, err := os.Stat(filepath.Join(wgRunDir, dev+".sock"))
+	if err != nil || sock.Mode()&os.ModeSocket == 0 {
+		return "", false
+	}
+	mapping, err := os.Stat(nameFile)
+	if err != nil {
+		return "", false
+	}
+	if skew := sock.ModTime().Sub(mapping.ModTime()); skew >= 2*time.Second || skew <= -2*time.Second {
+		return "", false
+	}
+	return dev, true
 }
 
 func run(name string, args ...string) error {
