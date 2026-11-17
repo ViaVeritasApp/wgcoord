@@ -81,7 +81,8 @@ For anything long-lived, run both under [systemd](#running-as-a-service-systemd)
 
 Resolved in order: `--config <path>` (any command), `$WGCOORD_CONFIG`,
 `/etc/wgcoord/config.json` as root, else `~/.config/wgcoord/config.json`. It
-holds private keys and, on clients, the token.
+holds private keys and, on clients, the token of every
+[profile](#profiles-several-coordinators).
 
 Root and your own user resolve **different files**. Run every command as the
 daemon's user, which means `sudo`:
@@ -153,8 +154,13 @@ sudo wgcoord coordinator client add server-a --address 10.8.0.20 --route 10.12.1
 
 | Command | What it does | Example |
 |---|---|---|
-| `client join` | Register with a token, write config, apply the first peer set. | `wgcoord client join --server http://203.0.113.1:51821 --token <TOKEN>` |
-| `client run` | Heartbeat and keep the interface in sync (foreground). | `wgcoord client run` |
+| `client join` | Register with a token and save it as a profile; the first profile is also brought up. | `wgcoord client join --server http://203.0.113.1:51821 --token <TOKEN>` |
+| `client run` | Heartbeat the active profile and keep the interface in sync (foreground). Follows `client use`. | `wgcoord client run` |
+| `client use <profile>` | Close every profile's interface, then connect this one (alias `switch`). | `wgcoord client use nx` |
+| `client profile list` | Show the profiles; `*` marks the active one (alias `ls`). | `wgcoord client profile list` |
+| `client profile rename <old> <new>` | Rename a profile. | `wgcoord client profile rename default vv` |
+| `client profile remove <profile>` | Delete a profile with its keys and token (aliases `rm`, `delete`). | `wgcoord client profile remove nx` |
+| `client profile import <profile> <config.json>` | Copy the client from another config file in as a profile. | `wgcoord client profile import nx /etc/wgcoord/nx/config.json` |
 | `client sync` | One heartbeat, then re-apply. | `wgcoord client sync` |
 | `client up` | Apply the cached peer set without calling the hub. | `wgcoord client up` |
 | `client down` | Tear the interface down. | `wgcoord client down` |
@@ -163,10 +169,14 @@ sudo wgcoord coordinator client add server-a --address 10.8.0.20 --route 10.12.1
 | `client endpoint clear <peer>` | Back to the advertised endpoint (aliases `unset`, `rm`). | `wgcoord client endpoint clear node2` |
 | `client endpoint list` | Show this node's overrides (alias `ls`). | `wgcoord client endpoint list` |
 
+Every client command takes `--profile <name>` (`-p`) to act on a profile other
+than the active one. See [Profiles](#profiles-several-coordinators).
+
 **`client join` flags**
 
 | Flag | Default | Description |
 |---|---|---|
+| `--profile` | `default` | Name of the new profile. Required once the machine has a profile. |
 | `--server` | (required) | Control-plane URL. |
 | `--token` | (required) | Token from `coordinator client add`. |
 | `--public-ip` | (none) | This node's public IP/host. Omit behind NAT to be dial-out only. |
@@ -185,6 +195,42 @@ sudo wgcoord client join --server http://203.0.113.1:51821 --token <TOKEN> \
 # behind NAT with nothing forwarded: dial-out only, kept open by keepalive
 sudo wgcoord client join --server http://203.0.113.1:51821 --token <TOKEN>
 ```
+
+### Profiles (several coordinators)
+
+A client can join several coordinators, each kept as a **profile** in the one
+config file. One profile is active, and only the active one is connected.
+
+```bash
+# first coordinator: profile "default", connected at once
+sudo wgcoord client join --server https://vv.example.com:51821 --token <TOKEN>
+sudo wgcoord client profile rename default vv
+
+# second coordinator: saved, not connected while vv is active
+sudo wgcoord client join --profile nx --server https://nx.example.com:51821 --token <TOKEN>
+
+sudo wgcoord client run                 # connects the active profile (vv)
+sudo wgcoord client use nx              # closes vv, connects nx
+sudo wgcoord client profile list
+sudo wgcoord client status -p vv        # inspect a profile without switching
+```
+
+- `client use` takes down **every** profile's interface, then brings the chosen
+  one up from its cached peers. Two profiles may share an interface name (`wg0`)
+  and port, since only one is ever up.
+- A running `client run` follows the switch within ~2s: it stops heartbeating
+  the old coordinator and starts on the new one. Only one `client run` runs per
+  config; `client run --profile nx` switches to `nx` and, if a daemon is already
+  running, leaves it to follow.
+- `client up --profile nx` switches as well. `sync`, `status`, `down` and
+  `endpoint …` with `--profile` act on that profile without switching. An edit
+  to an inactive profile is saved and applies when you switch to it.
+- A config from before profiles loads as one profile named `default`, and is
+  saved in the new layout on the next write.
+- A machine joined to several coordinators through separate `--config` files
+  can merge them without re-joining: `client profile import nx
+  /etc/wgcoord/nx/config.json` copies the keys, token and overrides, and leaves
+  the other file alone. Stop anything that still runs on the old file.
 
 ### Endpoint overrides
 
@@ -376,19 +422,21 @@ sudo wgcoord coordinator status              # what the daemon sees
 sudo wgcoord coordinator client add laptop   # redo it as root
 ```
 
-### `config already exists … — remove it to re-join`
+### `profile "default" already exists` on `client join`
 
-`join` won't overwrite a config. Removing it deletes the client's overrides as
+`join` won't overwrite a profile. Removing it deletes the client's overrides as
 well, so note them first:
 
 ```bash
 sudo wgcoord client endpoint list
-sudo wgcoord client down
-sudo rm /etc/wgcoord/config.json
+sudo wgcoord client profile remove default
 sudo wgcoord coordinator token regenerate node2   # on the hub, if the token is lost
 sudo wgcoord client join --server http://203.0.113.1:51821 --token <TOKEN> \
   --peer-endpoint node5=192.168.1.55
 ```
+
+To join a *different* coordinator instead, keep the profile and give the new
+one a name: `client join --profile <name> …`.
 
 On the hub, `coordinator init --force` replaces the hub keypair. Avoid it on a
 live mesh.

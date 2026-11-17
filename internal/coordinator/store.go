@@ -8,10 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
-	"os"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"wgcoord/internal/api"
@@ -44,23 +42,12 @@ func (s *Store) Mutate(fn func(cc *config.CoordinatorConfig) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	release, err := flock(config.Path() + ".lock")
-	if err != nil {
-		return err
-	}
-	defer release()
-
-	cfg, err := config.Load()
-	if err != nil {
-		return err
-	}
-	if cfg.Mode != config.ModeCoordinator || cfg.Coordinator == nil {
-		return fmt.Errorf("this machine is not a coordinator")
-	}
-	if err := fn(cfg.Coordinator); err != nil {
-		return err
-	}
-	return config.Save(cfg)
+	return config.Mutate(func(cfg *config.Config) error {
+		if cfg.Mode != config.ModeCoordinator || cfg.Coordinator == nil {
+			return fmt.Errorf("this machine is not a coordinator")
+		}
+		return fn(cfg.Coordinator)
+	})
 }
 
 // ClientOptions configures a new client. Routes and Grants take CIDRs or
@@ -552,24 +539,4 @@ func newID() string {
 		return "id-" + time.Now().UTC().Format("20060102150405.000000000")
 	}
 	return hex.EncodeToString(b)
-}
-
-// flock takes an exclusive advisory lock on path and returns a release func,
-// serializing config writes across the daemon and any CLI edit.
-func flock(path string) (func(), error) {
-	if err := os.MkdirAll(config.Dir(), 0o700); err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		f.Close()
-		return nil, err
-	}
-	return func() {
-		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		f.Close()
-	}, nil
 }

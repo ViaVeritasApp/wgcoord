@@ -1,5 +1,6 @@
 // Package config is the on-disk state for wgcoord: a single 0600 config.json
-// holding either a coordinator or a client section, discriminated by Mode.
+// holding either a coordinator section or a set of client profiles,
+// discriminated by Mode.
 package config
 
 import (
@@ -9,7 +10,11 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"wgcoord/internal/valid"
@@ -38,7 +43,13 @@ const (
 type Config struct {
 	Mode        string             `json:"mode"`
 	Coordinator *CoordinatorConfig `json:"coordinator,omitempty"`
-	Client      *ClientConfig      `json:"client,omitempty"`
+	// Client is the single-client layout from before profiles. Load moves it
+	// into Profiles under DefaultProfile, and Save never writes it.
+	Client *ClientConfig `json:"client,omitempty"`
+	// Profiles are the coordinators this client has joined, by profile name.
+	// At most one is connected at a time: ActiveProfile.
+	Profiles      map[string]*ClientConfig `json:"profiles,omitempty"`
+	ActiveProfile string                   `json:"active_profile,omitempty"`
 }
 
 // CoordinatorConfig is the control-plane + hub state. The coordinator is
@@ -304,18 +315,37 @@ func Exists() bool {
 
 // Load reads and parses the config, with a friendly error when it is missing.
 func Load() (*Config, error) {
-	b, err := os.ReadFile(Path())
+	return LoadFile(Path())
+}
+
+// LoadFile reads and parses the config at path. A client config in the
+// pre-profiles layout comes back as one profile named DefaultProfile.
+func LoadFile(path string) (*Config, error) {
+	b, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("no config at %s — run `wgcoord coordinator init` or `wgcoord client join` first", Path())
+			return nil, fmt.Errorf("no config at %s — run `wgcoord coordinator init` or `wgcoord client join` first", path)
 		}
 		return nil, err
 	}
 	var c Config
 	if err := json.Unmarshal(b, &c); err != nil {
-		return nil, fmt.Errorf("invalid config %s: %w", Path(), err)
+		return nil, fmt.Errorf("invalid config %s: %w", path, err)
 	}
+	c.migrate()
 	return &c, nil
+}
+
+// migrate moves a pre-profiles client section into Profiles.
+func (c *Config) migrate() {
+	if c.Mode != ModeClient || c.Client == nil {
+		return
+	}
+	if len(c.Profiles) == 0 {
+		c.Profiles = map[string]*ClientConfig{DefaultProfile: c.Client}
+		c.ActiveProfile = DefaultProfile
+	}
+	c.Client = nil
 }
 
 // LoadCoordinator loads the config and asserts coordinator mode.
@@ -330,20 +360,167 @@ func LoadCoordinator() (*Config, *CoordinatorConfig, error) {
 	return c, c.Coordinator, nil
 }
 
-// LoadClient loads the config and asserts client mode.
-func LoadClient() (*Config, *ClientConfig, error) {
+// LoadClient loads the config and asserts client mode with at least one
+// profile.
+func LoadClient() (*Config, error) {
 	c, err := Load()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	if c.Mode != ModeClient || c.Client == nil {
-		return nil, nil, fmt.Errorf("this machine is not a client (mode=%q) — run `wgcoord client join`", c.Mode)
+	if err := c.AssertClient(); err != nil {
+		return nil, err
 	}
-	return c, c.Client, nil
+	return c, nil
+}
+
+// AssertClient reports an error unless c is a client config with a profile.
+func (c *Config) AssertClient() error {
+	if c.Mode != ModeClient || len(c.Profiles) == 0 {
+		return fmt.Errorf("this machine is not a client (mode=%q) — run `wgcoord client join`", c.Mode)
+	}
+	return nil
+}
+
+// LoadProfile loads the config and returns the named profile, or the active
+// one when name is empty.
+func LoadProfile(name string) (*Config, string, *ClientConfig, error) {
+	c, err := LoadClient()
+	if err != nil {
+		return nil, "", nil, err
+	}
+	name, cc, err := c.Profile(name)
+	if err != nil {
+		return nil, "", nil, err
+	}
+	return c, name, cc, nil
+}
+
+// Profile returns the named profile, or the active one when name is empty.
+func (c *Config) Profile(name string) (string, *ClientConfig, error) {
+	if name == "" {
+		name = c.ActiveProfile
+		if name == "" {
+			return "", nil, fmt.Errorf("no active profile — pick one with `wgcoord client use <profile>` (have: %s)", strings.Join(c.ProfileNames(), ", "))
+		}
+	}
+	cc, ok := c.Profiles[name]
+	if !ok || cc == nil {
+		return "", nil, fmt.Errorf("no profile named %q (have: %s)", name, orNone(c.ProfileNames()))
+	}
+	return name, cc, nil
+}
+
+// ProfileNames lists the profiles in name order.
+func (c *Config) ProfileNames() []string {
+	names := make([]string, 0, len(c.Profiles))
+	for n := range c.Profiles {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func orNone(names []string) string {
+	if len(names) == 0 {
+		return "none"
+	}
+	return strings.Join(names, ", ")
+}
+
+// DefaultProfile names the first profile when `client join` is given none,
+// and a client config migrated from before profiles.
+const DefaultProfile = "default"
+
+// ValidProfileName checks a profile name: 1-32 letters, digits, '.', '_' or
+// '-', not starting with '.' or '-'.
+func ValidProfileName(n string) error {
+	if n == "" || len(n) > 32 {
+		return fmt.Errorf("profile name %q must be 1-32 characters", n)
+	}
+	for i, r := range n {
+		ok := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' ||
+			r == '_' || (i > 0 && (r == '.' || r == '-'))
+		if !ok {
+			return fmt.Errorf("profile name %q may use only letters, digits, '.', '_' and '-' (not first)", n)
+		}
+	}
+	return nil
+}
+
+// lockMu serializes Lock within this process; the file lock alone would not,
+// since each call opens its own descriptor.
+var lockMu sync.Mutex
+
+// Lock takes an exclusive lock on the config, shared with every other wgcoord
+// process, and returns its release func. It is not reentrant.
+func Lock() (func(), error) {
+	lockMu.Lock()
+	if err := os.MkdirAll(Dir(), 0o700); err != nil {
+		lockMu.Unlock()
+		return nil, err
+	}
+	f, err := os.OpenFile(Path()+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		lockMu.Unlock()
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		lockMu.Unlock()
+		return nil, err
+	}
+	return func() {
+		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		f.Close()
+		lockMu.Unlock()
+	}, nil
+}
+
+// Mutate loads the config under Lock, runs fn on it, and saves it when fn
+// returns nil.
+func Mutate(fn func(c *Config) error) error {
+	release, err := Lock()
+	if err != nil {
+		return err
+	}
+	defer release()
+	c, err := Load()
+	if err != nil {
+		return err
+	}
+	if err := fn(c); err != nil {
+		return err
+	}
+	return Save(c)
+}
+
+// TryLockDaemon takes a non-blocking lock held for the life of `client run`,
+// so a second daemon on the same config can tell one is already running. ok
+// is false when another process holds it.
+func TryLockDaemon() (release func(), ok bool, err error) {
+	if err := os.MkdirAll(Dir(), 0o700); err != nil {
+		return nil, false, err
+	}
+	f, err := os.OpenFile(Path()+".run.lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return func() {
+		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		f.Close()
+	}, true, nil
 }
 
 // Save writes the config atomically (temp file + rename) at 0600.
 func Save(c *Config) error {
+	c.migrate()
 	dir := Dir()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err

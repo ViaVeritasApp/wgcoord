@@ -51,8 +51,32 @@ var (
 // indirected for tests.
 var meshAvailable = wgctl.Available
 
+// Seams for the live interface, replaced in tests.
+var (
+	wgApply      = wgctl.Apply
+	wgDown       = wgctl.Down
+	wgSyncRoutes = wgctl.SyncRoutes
+	wgTagsRoutes = wgctl.TagsRoutes
+)
+
+// profilePoll is how often `client run` checks whether the active profile
+// changed, so a switch takes effect within seconds, not a heartbeat interval.
+var profilePoll = 2 * time.Second
+
+// Applied is the outcome of bringing a profile's interface in line: the .conf
+// written and the apply error, which may be wgctl.ErrUnsupported. Skipped means
+// the profile is not the active one, so nothing was touched.
+type Applied struct {
+	ConfPath string
+	Err      error
+	Skipped  bool
+}
+
 // JoinOptions configures a first-time join.
 type JoinOptions struct {
+	// Profile names the new profile. Empty means DefaultProfile, and is only
+	// allowed while the machine has no profile yet.
+	Profile           string
 	CoordinatorURL    string
 	Token             string
 	Name              string
@@ -65,14 +89,31 @@ type JoinOptions struct {
 	EndpointOverrides map[string]string
 }
 
-// Join generates a keypair, registers, and persists the client config with the
-// returned address and peer set.
-func Join(o JoinOptions) (*config.ClientConfig, error) {
+// Joined is a new profile. Active is set when it became the active profile
+// (no other was active), in which case Applied reports bringing it up.
+type Joined struct {
+	Profile string
+	Client  *config.ClientConfig
+	Active  bool
+	Applied Applied
+}
+
+// Join generates a keypair, registers, and saves the result as a new profile.
+// It becomes the active profile only when none is active, so joining a second
+// coordinator never drops the connection to the first.
+func Join(o JoinOptions) (*Joined, error) {
 	if strings.TrimSpace(o.CoordinatorURL) == "" {
 		return nil, fmt.Errorf("--server (coordinator URL) is required")
 	}
 	if strings.TrimSpace(o.Token) == "" {
 		return nil, fmt.Errorf("--token is required")
+	}
+	name := strings.TrimSpace(o.Profile)
+	if err := checkJoinable(name); err != nil {
+		return nil, err
+	}
+	if name == "" {
+		name = config.DefaultProfile
 	}
 	kp, err := wgkey.Generate()
 	if err != nil {
@@ -101,17 +142,75 @@ func Join(o JoinOptions) (*config.ClientConfig, error) {
 	cc.InternalURL = resp.ControlURL
 	cc.Peers = toPeers(resp.Peers)
 	cc.HubOnly = resp.HubOnly
-	if err := save(cc); err != nil {
+
+	out := &Joined{Profile: name, Client: cc, Applied: Applied{Skipped: true}}
+	err = mutate(true, func(c *config.Config) error {
+		if _, ok := c.Profiles[name]; ok {
+			return fmt.Errorf("profile %q already exists", name)
+		}
+		if c.Profiles == nil {
+			c.Profiles = map[string]*config.ClientConfig{}
+		}
+		c.Profiles[name] = cc
+		if c.ActiveProfile == "" {
+			c.ActiveProfile = name
+			out.Active = true
+			out.Applied = apply(cc)
+		}
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return cc, nil
+	return out, nil
 }
 
-// Sync sends one heartbeat and folds the returned delta into the cached peers.
-func Sync() (*config.ClientConfig, *api.HeartbeatResponse, error) {
-	_, cc, err := config.LoadClient()
+// checkJoinable refuses a join before it registers, since registering spends
+// the token's first use: a taken profile name, a coordinator host, or a second
+// unnamed profile.
+func checkJoinable(name string) error {
+	if name != "" {
+		if err := config.ValidProfileName(name); err != nil {
+			return err
+		}
+	}
+	if !config.Exists() {
+		return nil
+	}
+	c, err := config.Load()
 	if err != nil {
-		return nil, nil, err
+		return err
+	}
+	if c.Mode != config.ModeClient {
+		return fmt.Errorf("%s is a %s config — a host is either a coordinator or a client", config.Path(), c.Mode)
+	}
+	if name == "" && len(c.Profiles) > 0 {
+		return fmt.Errorf("already joined (profiles: %s) — name the new one with --profile <name>", strings.Join(c.ProfileNames(), ", "))
+	}
+	if name == "" {
+		name = config.DefaultProfile
+	}
+	if _, ok := c.Profiles[name]; ok {
+		return fmt.Errorf("profile %q already exists — pick another --profile, or remove it first with `wgcoord client profile remove %s`", name, name)
+	}
+	return nil
+}
+
+// SyncResult is one heartbeat folded into a profile.
+type SyncResult struct {
+	Profile string
+	Client  *config.ClientConfig
+	Resp    *api.HeartbeatResponse
+	Applied Applied
+}
+
+// Sync sends one heartbeat for the named profile (the active one when empty),
+// folds the returned delta into its cached peers, and re-applies the
+// interface when the profile is active.
+func Sync(profile string) (*SyncResult, error) {
+	_, name, cc, err := config.LoadProfile(profile)
+	if err != nil {
+		return nil, err
 	}
 	req := api.HeartbeatRequest{
 		Have:           peerIDs(cc.Peers),
@@ -121,9 +220,34 @@ func Sync() (*config.ClientConfig, *api.HeartbeatResponse, error) {
 	}
 	var resp api.HeartbeatResponse
 	if err := post(cc, "/heartbeat", req, &resp); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	applyDelta(cc, &resp)
+	res := &SyncResult{Profile: name, Resp: &resp}
+	// The heartbeat ran unlocked, so fold it into a fresh copy: a CLI edit made
+	// meanwhile (an endpoint override, a switch) must survive.
+	err = mutate(false, func(c *config.Config) error {
+		fresh, ok := c.Profiles[name]
+		if !ok {
+			return fmt.Errorf("profile %q was removed during the heartbeat", name)
+		}
+		applyHeartbeat(fresh, &resp)
+		res.Client = fresh
+		if c.ActiveProfile == name {
+			res.Applied = apply(fresh)
+		} else {
+			res.Applied = Applied{Skipped: true}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// applyHeartbeat folds a heartbeat response into cc.
+func applyHeartbeat(cc *config.ClientConfig, resp *api.HeartbeatResponse) {
+	applyDelta(cc, resp)
 	if resp.Address != "" {
 		cc.Address = resp.Address
 	}
@@ -134,63 +258,212 @@ func Sync() (*config.ClientConfig, *api.HeartbeatResponse, error) {
 	// control plane, and the client should stop preferring the old one.
 	cc.InternalURL = resp.ControlURL
 	cc.HubOnly = resp.HubOnly
-	if err := save(cc); err != nil {
-		return nil, nil, err
-	}
-	return cc, &resp, nil
 }
 
-// Run beats the coordinator on the configured interval until ctx is cancelled.
+// Run beats the active profile's coordinator until ctx is cancelled. It
+// follows the active profile: after `client use <other>`, it stops beating the
+// old coordinator and starts on the new one within profilePoll.
 func Run(ctx context.Context, logger *log.Logger) error {
-	_, cc, err := config.LoadClient()
-	if err != nil {
+	if _, err := config.LoadClient(); err != nil {
 		return err
 	}
-	interval := cc.HeartbeatInterval()
-	target := cc.CoordinatorURL
-	if cc.InternalURL != "" {
-		target = fmt.Sprintf("%s (over the mesh, falling back to %s)", cc.InternalURL, cc.CoordinatorURL)
+	var (
+		cur       string
+		started   bool
+		ticker    *time.Ticker
+		tick      <-chan time.Time
+		lastApply string
+		lastLoad  string
+	)
+	stopTicker := func() {
+		if ticker != nil {
+			ticker.Stop()
+			ticker, tick = nil, nil
+		}
 	}
-	logger.Printf("client %q up; beating %s every %s", cc.Name, target, interval)
-	var lastApply string
-	beat(logger, &lastApply)
+	defer stopTicker()
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	check := func() {
+		c, err := config.LoadClient()
+		if err != nil {
+			if err.Error() != lastLoad {
+				logger.Printf("config: %v", err)
+				lastLoad = err.Error()
+			}
+			return
+		}
+		lastLoad = ""
+		name := c.ActiveProfile
+		if _, ok := c.Profiles[name]; !ok {
+			name = ""
+		}
+		if started && name == cur {
+			return
+		}
+		started = true
+		stopTicker()
+		if cur != "" && name != cur {
+			logger.Printf("profile %q is no longer active; stopped beating its coordinator", cur)
+		}
+		cur, lastApply = name, ""
+		resetInternal() // a cooldown earned by another coordinator says nothing about this one
+		if name == "" {
+			logger.Print("no active profile; idle until `wgcoord client use <profile>`")
+			return
+		}
+		cc := c.Profiles[name]
+		interval := cc.HeartbeatInterval()
+		target := cc.CoordinatorURL
+		if cc.InternalURL != "" {
+			target = fmt.Sprintf("%s (over the mesh, falling back to %s)", cc.InternalURL, cc.CoordinatorURL)
+		}
+		logger.Printf("profile %q: client %q up; beating %s every %s", name, cc.Name, target, interval)
+		ticker = time.NewTicker(interval)
+		tick = ticker.C
+		beat(logger, name, &lastApply)
+	}
+
+	check()
+	poll := time.NewTicker(profilePoll)
+	defer poll.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
-			beat(logger, &lastApply)
+		case <-poll.C:
+			check()
+		case <-tick:
+			beat(logger, cur, &lastApply)
 		}
 	}
 }
 
-// Up applies the cached peer set to the interface without contacting the
-// coordinator.
-func Up() (string, error) {
-	_, cc, err := config.LoadClient()
+// Activated is a profile brought up by Use or Up. Previous is the profile
+// that was active before; it equals Profile when nothing was switched.
+type Activated struct {
+	Profile  string
+	Previous string
+	Client   *config.ClientConfig
+	Applied  Applied
+}
+
+// Use makes name the active profile: it closes every profile's interface,
+// then brings name's up from its cached peers. A running `client run` follows
+// within profilePoll.
+func Use(name string) (*Activated, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, fmt.Errorf("a profile name is required")
+	}
+	out := &Activated{Profile: name}
+	err := mutate(false, func(c *config.Config) error {
+		_, cc, err := c.Profile(name)
+		if err != nil {
+			return err
+		}
+		out.Previous = c.ActiveProfile
+		// Close every profile, the target included: macOS installs a tunnel's
+		// routes only when it comes up, so even a profile sharing the target's
+		// interface name has to go down before the target comes up.
+		if err := downAll(c); err != nil {
+			return err
+		}
+		c.ActiveProfile = name
+		out.Client = cc
+		out.Applied = apply(cc)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// downAll takes down every profile's interface, once per interface name.
+func downAll(c *config.Config) error {
+	done := map[string]bool{}
+	for _, n := range c.ProfileNames() {
+		p := c.Profiles[n]
+		if p == nil || done[p.Interface] {
+			continue
+		}
+		done[p.Interface] = true
+		if err := downProfile(p); err != nil && !errors.Is(err, wgctl.ErrUnsupported) {
+			return fmt.Errorf("close profile %q (%s): %w", n, p.Interface, err)
+		}
+		// Routes die with the interface.
+		p.ManagedRoutes = nil
+	}
+	return nil
+}
+
+// Up applies a profile's cached peer set without contacting its coordinator.
+// An empty profile means the active one; naming another switches to it, as
+// Use does.
+func Up(profile string) (*Activated, error) {
+	c, err := config.LoadClient()
+	if err != nil {
+		return nil, err
+	}
+	name, _, err := c.Profile(profile)
+	if err != nil {
+		return nil, err
+	}
+	if name != c.ActiveProfile {
+		return Use(name)
+	}
+	out := &Activated{Profile: name, Previous: name}
+	err = mutate(false, func(c *config.Config) error {
+		_, cc, err := c.Profile(name)
+		if err != nil {
+			return err
+		}
+		out.Client = cc
+		out.Applied = apply(cc)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// Down removes a profile's WireGuard interface (the active profile's when
+// empty) and returns the profile's name. The profile stays active, so a
+// running `client run` brings it back on its next beat.
+func Down(profile string) (string, error) {
+	c, name, cc, err := config.LoadProfile(profile)
 	if err != nil {
 		return "", err
 	}
-	return Apply(cc)
+	if active, ok := c.Profiles[c.ActiveProfile]; ok && name != c.ActiveProfile && active.Interface == cc.Interface {
+		return "", fmt.Errorf("profile %q is not connected; %s belongs to the active profile %q", name, cc.Interface, c.ActiveProfile)
+	}
+	return name, downProfile(cc)
 }
 
-// Down removes the WireGuard interface.
-func Down() error {
-	_, cc, err := config.LoadClient()
-	if err != nil {
+// downProfile takes cc's interface down. The .conf is written first: macOS
+// wg-quick reads it on the way down, and a profile imported from another
+// config directory has none here yet.
+func downProfile(cc *config.ClientConfig) error {
+	if err := wgctl.WriteConfigFile(confPath(cc), renderInterface(cc)); err != nil {
 		return err
 	}
-	return wgctl.Down(cc.Interface)
+	return wgDown(cc.Interface)
+}
+
+// Edited is a profile changed in place, re-applied when it is active.
+type Edited struct {
+	Profile string
+	Client  *config.ClientConfig
+	Applied Applied
 }
 
 // SetEndpointOverride pins the endpoint this node dials for a peer and persists
 // it. The coordinator is never told: an override describes how *this* node
 // reaches the peer from where it sits, which is what a peer behind the same NAT
 // needs when the router won't hairpin its own public address.
-func SetEndpointOverride(peer, endpoint string) (*config.ClientConfig, error) {
+func SetEndpointOverride(profile, peer, endpoint string) (*Edited, error) {
 	peer = strings.TrimSpace(peer)
 	if peer == "" {
 		return nil, fmt.Errorf("a peer name or id is required")
@@ -198,43 +471,77 @@ func SetEndpointOverride(peer, endpoint string) (*config.ClientConfig, error) {
 	if err := valid.EndpointOverride(endpoint); err != nil {
 		return nil, err
 	}
-	_, cc, err := config.LoadClient()
-	if err != nil {
-		return nil, err
-	}
-	if cc.EndpointOverrides == nil {
-		cc.EndpointOverrides = make(map[string]string, 1)
-	}
-	cc.EndpointOverrides[peer] = endpoint
-	if err := save(cc); err != nil {
-		return nil, err
-	}
-	return cc, nil
+	return editProfile(profile, func(cc *config.ClientConfig) error {
+		if cc.EndpointOverrides == nil {
+			cc.EndpointOverrides = make(map[string]string, 1)
+		}
+		cc.EndpointOverrides[peer] = endpoint
+		return nil
+	})
 }
 
 // ClearEndpointOverride drops an override, restoring the coordinator-advertised
 // endpoint on the next apply.
-func ClearEndpointOverride(peer string) (*config.ClientConfig, error) {
-	_, cc, err := config.LoadClient()
+func ClearEndpointOverride(profile, peer string) (*Edited, error) {
+	return editProfile(profile, func(cc *config.ClientConfig) error {
+		if _, ok := cc.EndpointOverrides[peer]; !ok {
+			return fmt.Errorf("no endpoint override set for %q", peer)
+		}
+		delete(cc.EndpointOverrides, peer)
+		if len(cc.EndpointOverrides) == 0 {
+			cc.EndpointOverrides = nil
+		}
+		return nil
+	})
+}
+
+// editProfile runs fn on a profile under the config lock, saves it, and
+// re-applies it when it is the active profile.
+func editProfile(profile string, fn func(cc *config.ClientConfig) error) (*Edited, error) {
+	out := &Edited{}
+	err := mutate(false, func(c *config.Config) error {
+		name, cc, err := c.Profile(profile)
+		if err != nil {
+			return err
+		}
+		if err := fn(cc); err != nil {
+			return err
+		}
+		out.Profile, out.Client = name, cc
+		if name == c.ActiveProfile {
+			out.Applied = apply(cc)
+		} else {
+			out.Applied = Applied{Skipped: true}
+		}
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	if _, ok := cc.EndpointOverrides[peer]; !ok {
-		return nil, fmt.Errorf("no endpoint override set for %q", peer)
-	}
-	delete(cc.EndpointOverrides, peer)
-	if len(cc.EndpointOverrides) == 0 {
-		cc.EndpointOverrides = nil
-	}
-	if err := save(cc); err != nil {
-		return nil, err
-	}
-	return cc, nil
+	return out, nil
 }
 
-// Apply renders the interface (self + cached peers), writes the .conf, and
-// applies it live. The path is always written; err may be wgctl.ErrUnsupported.
-func Apply(cc *config.ClientConfig) (string, error) {
+// apply renders the interface (self + cached peers), writes the .conf, and
+// applies it live. The .conf is always written; Err may be
+// wgctl.ErrUnsupported. It updates cc.ManagedRoutes and never saves: callers
+// hold the config lock and save once.
+func apply(cc *config.ClientConfig) Applied {
+	path := confPath(cc)
+	iface := renderInterface(cc)
+	if err := wgctl.WriteConfigFile(path, iface); err != nil {
+		return Applied{ConfPath: path, Err: err}
+	}
+	if err := wgApply(iface); err != nil {
+		return Applied{ConfPath: path, Err: err}
+	}
+	return Applied{ConfPath: path, Err: syncRoutes(cc)}
+}
+
+func confPath(cc *config.ClientConfig) string {
+	return filepath.Join(config.Dir(), cc.Interface+".conf")
+}
+
+func renderInterface(cc *config.ClientConfig) wgctl.Interface {
 	bits := 32
 	if cc.IPRange != "" {
 		if b, err := ipalloc.PrefixBits(cc.IPRange); err == nil {
@@ -257,14 +564,7 @@ func Apply(cc *config.ClientConfig) (string, error) {
 			Keepalive:  cc.EffectiveKeepalive(),
 		})
 	}
-	confPath := filepath.Join(config.Dir(), cc.Interface+".conf")
-	if err := wgctl.WriteConfigFile(confPath, iface); err != nil {
-		return confPath, err
-	}
-	if err := wgctl.Apply(iface); err != nil {
-		return confPath, err
-	}
-	return confPath, syncRoutes(cc)
+	return iface
 }
 
 // syncRoutes routes a hub-only client's granted ranges into the tunnel. Mesh
@@ -272,25 +572,48 @@ func Apply(cc *config.ClientConfig) (string, error) {
 // coordinator allows (pod ranges, networks next to the coordinator) needs a
 // kernel route. Mesh clients get none: there a CNI or the operator owns
 // routing, and any routes left from an earlier hub-only stint are removed.
+// The routes installed are recorded in cc.ManagedRoutes for the caller to save.
 func syncRoutes(cc *config.ClientConfig) error {
 	var want []string
 	if cc.HubOnly {
 		want = hubRoutes(cc)
 	}
-	if len(want) == 0 && len(cc.ManagedRoutes) == 0 && !cc.HubOnly && !wgctl.TagsRoutes() {
+	if len(want) == 0 && len(cc.ManagedRoutes) == 0 && !cc.HubOnly && !wgTagsRoutes() {
 		return nil
 	}
-	managed, err := wgctl.SyncRoutes(cc.Interface, want, cc.ManagedRoutes)
+	managed, err := wgSyncRoutes(cc.Interface, want, cc.ManagedRoutes)
 	if errors.Is(err, wgctl.ErrUnsupported) {
 		return nil
 	}
-	if strings.Join(managed, ",") != strings.Join(cc.ManagedRoutes, ",") {
-		cc.ManagedRoutes = managed
-		if serr := save(cc); serr != nil && err == nil {
-			err = serr
-		}
-	}
+	cc.ManagedRoutes = managed
 	return err
+}
+
+// mutate loads the config under the config lock, runs fn, and saves it. With
+// create, a missing config starts out as an empty client config.
+func mutate(create bool, fn func(c *config.Config) error) error {
+	release, err := config.Lock()
+	if err != nil {
+		return err
+	}
+	defer release()
+	var c *config.Config
+	if create && !config.Exists() {
+		c = &config.Config{Mode: config.ModeClient}
+	} else if c, err = config.Load(); err != nil {
+		return err
+	}
+	if create {
+		if c.Mode != config.ModeClient {
+			return fmt.Errorf("%s is a %s config — a host is either a coordinator or a client", config.Path(), c.Mode)
+		}
+	} else if err := c.AssertClient(); err != nil {
+		return err
+	}
+	if err := fn(c); err != nil {
+		return err
+	}
+	return config.Save(c)
 }
 
 // hubRoutes lists the coordinator peer's AllowedIPs that fall outside the mesh
@@ -336,19 +659,23 @@ func register(cc *config.ClientConfig, requestedAddr string) (*api.RegisterRespo
 	return &resp, nil
 }
 
-// beat runs one Sync + Apply, logging transient errors rather than failing. An
-// apply fault persists across beats, so lastApply carries it and only a change
-// is logged — otherwise one broken interface fills the log every interval.
-func beat(logger *log.Logger, lastApply *string) {
-	cc, resp, err := Sync()
+// beat runs one Sync (which re-applies), logging transient errors rather
+// than failing. An apply fault persists across beats, so lastApply carries it
+// and only a change is logged — otherwise one broken interface fills the log
+// every interval.
+func beat(logger *log.Logger, profile string, lastApply *string) {
+	res, err := Sync(profile)
 	if err != nil {
-		logger.Printf("heartbeat: %v", err)
+		logger.Printf("heartbeat (%s): %v", profile, err)
 		return
 	}
-	if len(resp.Add) > 0 || len(resp.Remove) > 0 {
-		logger.Printf("peers changed: +%d -%d", len(resp.Add), len(resp.Remove))
+	if len(res.Resp.Add) > 0 || len(res.Resp.Remove) > 0 {
+		logger.Printf("peers changed (%s): +%d -%d", profile, len(res.Resp.Add), len(res.Resp.Remove))
 	}
-	_, err = Apply(cc)
+	if res.Applied.Skipped {
+		return // switched away mid-beat; the next poll picks up the new profile
+	}
+	err = res.Applied.Err
 	if errors.Is(err, wgctl.ErrUnsupported) {
 		err = nil // Control plane only on this host, not a fault.
 	}
@@ -357,7 +684,7 @@ func beat(logger *log.Logger, lastApply *string) {
 		logger.Print("apply: recovered")
 		*lastApply = ""
 	case err != nil && err.Error() != *lastApply:
-		logger.Printf("apply: %v", err)
+		logger.Printf("apply (%s): %v", profile, err)
 		*lastApply = err.Error()
 	}
 }
@@ -406,10 +733,6 @@ func peerIDs(peers []config.Peer) []string {
 		ids = append(ids, p.ID)
 	}
 	return ids
-}
-
-func save(cc *config.ClientConfig) error {
-	return config.Save(&config.Config{Mode: config.ModeClient, Client: cc})
 }
 
 // post sends a control-plane request, preferring the coordinator's in-mesh
@@ -490,6 +813,14 @@ func internalBase(cc *config.ClientConfig) string {
 		return ""
 	}
 	return cc.InternalURL
+}
+
+// resetInternal lifts the cooldown, e.g. when switching to another
+// coordinator.
+func resetInternal() {
+	internalMu.Lock()
+	defer internalMu.Unlock()
+	internalUntil = time.Time{}
 }
 
 func coolDownInternal() {
