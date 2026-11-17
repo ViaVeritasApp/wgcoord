@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"strings"
 	"sync"
@@ -62,29 +63,48 @@ func (s *Store) Mutate(fn func(cc *config.CoordinatorConfig) error) error {
 	return config.Save(cfg)
 }
 
+// ClientOptions configures a new client. Routes and Grants take CIDRs or
+// group names; Grants also take "all". Grants need HubOnly, and a hub-only
+// client can't carry Routes.
+type ClientOptions struct {
+	Address string
+	Routes  []string
+	HubOnly bool
+	Grants  []string
+}
+
+// AddedClient is a freshly created client, its one-time plaintext token, and
+// any warnings about grants the mesh only partly routes.
+type AddedClient struct {
+	Client   *config.Client
+	Token    string
+	Warnings []string
+}
+
 // AddClient creates a named client with a fresh token. A non-empty address is
-// reserved; otherwise the lowest free one is auto-allocated. routes are extra
-// CIDRs the client carries (see AddRoutes). The returned plaintext token is
-// shown once and never stored.
-func (s *Store) AddClient(name, address string, routes []string) (*config.Client, string, error) {
+// reserved; otherwise the lowest free one is auto-allocated. The returned
+// plaintext token is shown once and never stored.
+func (s *Store) AddClient(name string, o ClientOptions) (*AddedClient, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
-		return nil, "", fmt.Errorf("client name is required")
+		return nil, fmt.Errorf("client name is required")
 	}
-	canonRoutes, err := canonRoutes(routes)
-	if err != nil {
-		return nil, "", err
+	if o.HubOnly && len(o.Routes) > 0 {
+		return nil, fmt.Errorf("hub-only clients can't carry routes; drop --route or --hub-only")
+	}
+	if !o.HubOnly && len(o.Grants) > 0 {
+		return nil, ErrGrantNeedsHubOnly
 	}
 	tok, err := token.Generate()
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	var created *config.Client
+	out := &AddedClient{Token: tok}
 	err = s.Mutate(func(cc *config.CoordinatorConfig) error {
 		if findByName(cc, name) != nil {
 			return fmt.Errorf("a client named %q already exists", name)
 		}
-		addr := strings.TrimSpace(address)
+		addr := strings.TrimSpace(o.Address)
 		if addr == "" {
 			a, err := ipalloc.NextFree(cc.IPRange, usedAddrs(cc))
 			if err != nil {
@@ -94,41 +114,83 @@ func (s *Store) AddClient(name, address string, routes []string) (*config.Client
 		} else if err := checkAddrFree(cc, addr, ""); err != nil {
 			return err
 		}
+		routes, err := canonRefs(cc, o.Routes)
+		if err != nil {
+			return err
+		}
+		now := nowRFC3339()
 		c := &config.Client{
 			ID:        newID(),
 			Name:      name,
 			TokenHash: token.Hash(tok),
 			Address:   addr,
-			Routes:    canonRoutes,
-			CreatedAt: nowRFC3339(),
+			Routes:    routes,
+			HubOnly:   o.HubOnly,
+			CreatedAt: now,
 		}
 		cc.Clients = append(cc.Clients, c)
-		created = c
+		if err := checkAllRoutes(cc); err != nil {
+			return err
+		}
+		if len(o.Grants) > 0 {
+			if _, out.Warnings, err = addGrants(cc, c, o.Grants, nil); err != nil {
+				return err
+			}
+		}
+		if c.HubOnly {
+			cc.UpdatedAt = now // mesh clients route this address via the hub
+		}
+		out.Client = c
 		return nil
 	})
 	if err != nil {
-		return nil, "", err
-	}
-	return created, tok, nil
-}
-
-// AddRoutes appends extra CIDRs a node carries — its Kubernetes pod subnet, a
-// LAN behind it — to the AllowedIPs advertised for it, so peers route those
-// subnets through its tunnel instead of WireGuard dropping them. node is a
-// client name or "coordinator" (the hub itself). Duplicates are ignored; the
-// routes actually added are returned, and the change reaches peers on their
-// next heartbeat.
-func (s *Store) AddRoutes(node string, cidrs []string) ([]string, error) {
-	canon, err := canonRoutes(cidrs)
-	if err != nil {
 		return nil, err
 	}
-	if len(canon) == 0 {
-		return nil, fmt.Errorf("at least one CIDR is required")
+	return out, nil
+}
+
+// canonRefs canonicalizes route references, dropping duplicates in order.
+func canonRefs(cc *config.CoordinatorConfig, refs []string) ([]string, error) {
+	var out []string
+	seen := map[string]bool{}
+	for _, r := range refs {
+		c, err := canonRef(cc, r)
+		if err != nil {
+			return nil, err
+		}
+		if !seen[c] {
+			seen[c] = true
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
+// AddRoutes appends extra CIDRs or groups a node carries (its Kubernetes pod
+// subnet, a LAN behind it) to the AllowedIPs advertised for it, so peers route
+// those subnets through its tunnel instead of WireGuard dropping them. node is
+// a client name or "coordinator" (the hub itself). nat, valid only on the
+// coordinator, marks the routes as networks next to the hub that mesh traffic
+// is masqueraded into. Duplicates are ignored; the refs actually added (or
+// newly marked NAT) are returned, and peers pick them up on their next
+// heartbeat.
+func (s *Store) AddRoutes(node string, refs []string, nat bool) ([]string, error) {
+	if len(refs) == 0 {
+		return nil, fmt.Errorf("at least one CIDR or group is required")
+	}
+	if nat && !isHub(node) {
+		return nil, fmt.Errorf("--nat is only valid on the coordinator's own routes (wgcoord coordinator route add coordinator <cidr> --nat)")
 	}
 	var added []string
-	err = s.Mutate(func(cc *config.CoordinatorConfig) error {
+	err := s.Mutate(func(cc *config.CoordinatorConfig) error {
 		target, _, err := routesTarget(cc, node)
+		if err != nil {
+			return err
+		}
+		if c := findByName(cc, node); c != nil && c.HubOnly && !isHub(node) {
+			return fmt.Errorf("%q is a hub-only client and can't carry routes", c.Name)
+		}
+		canon, err := canonRefs(cc, refs)
 		if err != nil {
 			return err
 		}
@@ -137,16 +199,27 @@ func (s *Store) AddRoutes(node string, cidrs []string) ([]string, error) {
 			have[r] = true
 		}
 		for _, r := range canon {
+			newNAT := nat && !contains(cc.NATRoutes, r)
+			if newNAT {
+				cc.NATRoutes = append(cc.NATRoutes, r)
+			}
 			if have[r] {
+				if newNAT {
+					added = append(added, r)
+				}
 				continue
 			}
 			have[r] = true
 			*target = append(*target, r)
 			added = append(added, r)
 		}
-		if len(added) > 0 {
-			touchNode(cc, node)
+		if len(added) == 0 {
+			return nil
 		}
+		if err := checkAllRoutes(cc); err != nil {
+			return err
+		}
+		touchNode(cc, node)
 		return nil
 	})
 	if err != nil {
@@ -155,23 +228,27 @@ func (s *Store) AddRoutes(node string, cidrs []string) ([]string, error) {
 	return added, nil
 }
 
-// RemoveRoutes drops CIDRs from a node's advertised routes. node is a client
-// name or "coordinator". Returns the routes actually removed; the change
+// RemoveRoutes drops route refs (CIDRs or group names) from a node. node is a
+// client name or "coordinator". Returns the refs actually removed; the change
 // reaches peers on their next heartbeat.
-func (s *Store) RemoveRoutes(node string, cidrs []string) ([]string, error) {
-	canon, err := canonRoutes(cidrs)
-	if err != nil {
-		return nil, err
+func (s *Store) RemoveRoutes(node string, refs []string) ([]string, error) {
+	if len(refs) == 0 {
+		return nil, fmt.Errorf("at least one CIDR or group is required")
 	}
-	if len(canon) == 0 {
-		return nil, fmt.Errorf("at least one CIDR is required")
-	}
-	drop := make(map[string]bool, len(canon))
-	for _, r := range canon {
+	drop := make(map[string]bool, len(refs))
+	for _, r := range refs {
+		r = strings.TrimSpace(r)
+		if isCIDRRef(r) {
+			canon, err := valid.CIDR(r)
+			if err != nil {
+				return nil, err
+			}
+			r = canon
+		}
 		drop[r] = true
 	}
 	var removed []string
-	err = s.Mutate(func(cc *config.CoordinatorConfig) error {
+	err := s.Mutate(func(cc *config.CoordinatorConfig) error {
 		target, _, err := routesTarget(cc, node)
 		if err != nil {
 			return err
@@ -189,6 +266,9 @@ func (s *Store) RemoveRoutes(node string, cidrs []string) ([]string, error) {
 		} else {
 			*target = kept
 		}
+		if isHub(node) {
+			cc.NATRoutes = without(cc.NATRoutes, drop)
+		}
 		if len(removed) > 0 {
 			touchNode(cc, node)
 		}
@@ -198,6 +278,75 @@ func (s *Store) RemoveRoutes(node string, cidrs []string) ([]string, error) {
 		return nil, err
 	}
 	return removed, nil
+}
+
+// checkAllRoutes validates every node's routes together: groups used as routes
+// exist and carry no ports, no route sits inside the mesh range, hub-only
+// clients carry none, and no prefix is routed by two nodes (WireGuard would
+// hand it to whichever peer was configured last).
+func checkAllRoutes(cc *config.CoordinatorConfig) error {
+	mesh, haveMesh := meshPrefix(cc)
+	owner := map[netip.Prefix]string{}
+	check := func(node string, refs []string) error {
+		for _, ref := range refs {
+			if !isCIDRRef(ref) {
+				g := findGroup(cc, ref)
+				if g == nil {
+					return fmt.Errorf("%s routes group %q, which doesn't exist", node, ref)
+				}
+				for _, e := range g.Entries {
+					if len(e.Ports) > 0 {
+						return fmt.Errorf("group %q limits %s to %s, so it can't be used as a route; routes carry whole ranges", g.Name, e.CIDR, strings.Join(e.Ports, ", "))
+					}
+				}
+			}
+		}
+		for _, r := range resolveRoutes(cc, refs) {
+			p, err := netip.ParsePrefix(r)
+			if err != nil {
+				return err
+			}
+			if haveMesh && p.Bits() >= mesh.Bits() && mesh.Contains(p.Addr()) {
+				return fmt.Errorf("route %s is inside the mesh range %s; mesh addresses are already routed", p, mesh)
+			}
+			if prev, ok := owner[p]; ok && prev != node {
+				return fmt.Errorf("%s would be routed by both %s and %s; each prefix must belong to exactly one node", p, prev, node)
+			}
+			owner[p] = node
+		}
+		return nil
+	}
+	if err := check(api.CoordinatorPeerID, cc.Routes); err != nil {
+		return err
+	}
+	for _, c := range cc.Clients {
+		if c.HubOnly && len(c.Routes) > 0 {
+			return fmt.Errorf("%q is a hub-only client and can't carry routes", c.Name)
+		}
+		if err := check(c.Name, c.Routes); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func contains(list []string, v string) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+func without(list []string, drop map[string]bool) []string {
+	var out []string
+	for _, x := range list {
+		if !drop[x] {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 // Routes returns the routes configured for node (a client name or
@@ -219,6 +368,9 @@ func (s *Store) RemoveClient(name string) error {
 	return s.Mutate(func(cc *config.CoordinatorConfig) error {
 		for i, c := range cc.Clients {
 			if c.Name == name {
+				if c.HubOnly {
+					cc.UpdatedAt = nowRFC3339() // its /32 leaves the hub's AllowedIPs
+				}
 				cc.Clients = append(cc.Clients[:i], cc.Clients[i+1:]...)
 				return nil
 			}
@@ -278,6 +430,9 @@ func (s *Store) SetBlacklist(name string, blacklisted bool) error {
 		}
 		c.Blacklisted = blacklisted
 		c.UpdatedAt = nowRFC3339()
+		if c.HubOnly {
+			cc.UpdatedAt = c.UpdatedAt // its /32 leaves or rejoins the hub's AllowedIPs
+		}
 		return nil
 	})
 }
@@ -385,28 +540,6 @@ func touchNode(cc *config.CoordinatorConfig, node string) {
 	if c := findByName(cc, node); c != nil {
 		c.UpdatedAt = nowRFC3339()
 	}
-}
-
-// canonRoutes validates and canonicalizes route CIDRs, dropping duplicates
-// while preserving order.
-func canonRoutes(cidrs []string) ([]string, error) {
-	if len(cidrs) == 0 {
-		return nil, nil
-	}
-	seen := make(map[string]bool, len(cidrs))
-	out := make([]string, 0, len(cidrs))
-	for _, c := range cidrs {
-		canon, err := valid.CIDR(c)
-		if err != nil {
-			return nil, err
-		}
-		if seen[canon] {
-			continue
-		}
-		seen[canon] = true
-		out = append(out, canon)
-	}
-	return out, nil
 }
 
 func notFound(name string) error { return fmt.Errorf("no client named %q", name) }

@@ -67,6 +67,36 @@ type CoordinatorConfig struct {
 	// to clients that already hold it.
 	UpdatedAt string    `json:"updated_at,omitempty"`
 	Clients   []*Client `json:"clients"`
+	// Groups are named sets of CIDRs (optionally limited to ports), usable as
+	// grants for hub-only clients and, when they carry no ports, as routes.
+	Groups []*Group `json:"groups,omitempty"`
+	// NATRoutes are the hub's route refs (a CIDR or group name, as stored in
+	// Routes) that live outside the mesh, in the coordinator's own network.
+	// Mesh traffic leaving for them is masqueraded so replies find their way back.
+	NATRoutes []string `json:"nat_routes,omitempty"`
+}
+
+// Group is a named set of address entries. An entry's Ports narrow it to
+// specific protocols/ports; none means every port and protocol.
+type Group struct {
+	Name      string       `json:"name"`
+	Entries   []GroupEntry `json:"entries"`
+	UpdatedAt string       `json:"updated_at,omitempty"`
+}
+
+// GroupEntry is one CIDR in a group, in canonical form, with canonical port
+// specs ("tcp/5432", "udp/53", "tcp/8000-8100", "tcp").
+type GroupEntry struct {
+	CIDR  string   `json:"cidr"`
+	Ports []string `json:"ports,omitempty"`
+}
+
+// Grant is one destination a hub-only client may reach. Target is a
+// canonical CIDR, a group name, or "all" (the mesh range plus every route).
+// Ports narrow it further; when a group entry also has ports, both must match.
+type Grant struct {
+	Target string   `json:"target"`
+	Ports  []string `json:"ports,omitempty"`
 }
 
 // Client is one named node as the coordinator sees it. Only the token's
@@ -86,8 +116,16 @@ type Client struct {
 	// Routes are extra CIDRs this client carries beyond its own mesh /32,
 	// appended to the AllowedIPs advertised for it so peers route those subnets
 	// through its tunnel (e.g. a Kubernetes pod CIDR, or a LAN behind the node).
+	// Each entry is a CIDR or a group name, resolved when peers are built.
 	Routes []string `json:"routes,omitempty"`
 	Have   []string `json:"have,omitempty"` // peer ids this client last reported holding
+	// HubOnly clients peer with the coordinator alone. The hub forwards their
+	// traffic and its firewall limits it to Grants; other nodes never see them.
+	HubOnly bool    `json:"hub_only,omitempty"`
+	Grants  []Grant `json:"grants,omitempty"`
+	// SentHub is the coordinator AllowedIPs last sent to this hub-only client,
+	// so a heartbeat re-sends the coordinator peer only when it changed.
+	SentHub string `json:"sent_hub,omitempty"`
 }
 
 // ClientConfig is a client machine's state: how to reach the coordinator, its
@@ -112,6 +150,12 @@ type ClientConfig struct {
 	HeartbeatSeconds  int               `json:"heartbeat_seconds,omitempty"`
 	EndpointOverrides map[string]string `json:"endpoint_overrides,omitempty"`
 	Peers             []Peer            `json:"peers"`
+	// HubOnly mirrors the coordinator's setting for this client: it peers with
+	// the coordinator alone, which forwards its traffic.
+	HubOnly bool `json:"hub_only,omitempty"`
+	// ManagedRoutes are the kernel routes wgcoord installed for a hub-only
+	// client's granted ranges (macOS only; Linux tags its routes instead).
+	ManagedRoutes []string `json:"managed_routes,omitempty"`
 }
 
 // Peer is one other mesh member as cached on a client.

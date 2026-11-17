@@ -33,6 +33,7 @@ type RegisterResponse struct {
 	IPRange    string `json:"ip_range"`
 	ControlURL string `json:"control_url,omitempty"` // see HeartbeatResponse.ControlURL
 	Peers      []Peer `json:"peers"`
+	HubOnly    bool   `json:"hub_only,omitempty"` // see HeartbeatResponse.HubOnly
 }
 
 // HeartbeatRequest is posted to POST /heartbeat. Have lists the peer ids the
@@ -56,6 +57,9 @@ type HeartbeatResponse struct {
 	ControlURL string   `json:"control_url,omitempty"`
 	Add        []Peer   `json:"add"`
 	Remove     []string `json:"remove"`
+	// HubOnly tells the client it peers with the coordinator alone, which
+	// forwards its traffic; the client then routes its granted ranges itself.
+	HubOnly bool `json:"hub_only,omitempty"`
 }
 
 // ErrorResponse is the body returned for any non-2xx control-plane response.

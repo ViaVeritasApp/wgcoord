@@ -155,3 +155,18 @@ func TestInternalBaseGating(t *testing.T) {
 		})
 	}
 }
+
+func TestHubRoutesSkipsMeshRange(t *testing.T) {
+	cc := &config.ClientConfig{
+		IPRange: "10.8.0.0/24",
+		HubOnly: true,
+		Peers: []config.Peer{
+			{ID: api.CoordinatorPeerID, AllowedIPs: "10.8.0.0/24, 10.42.0.0/24, 10.42.1.0/24, 172.30.0.5/32"},
+			{ID: "other", AllowedIPs: "10.99.0.0/16"},
+		},
+	}
+	got := strings.Join(hubRoutes(cc), " ")
+	if got != "10.42.0.0/24 10.42.1.0/24 172.30.0.5/32" {
+		t.Fatalf("hubRoutes = %q", got)
+	}
+}

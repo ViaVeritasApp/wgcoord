@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -99,6 +100,7 @@ func Join(o JoinOptions) (*config.ClientConfig, error) {
 	cc.IPRange = resp.IPRange
 	cc.InternalURL = resp.ControlURL
 	cc.Peers = toPeers(resp.Peers)
+	cc.HubOnly = resp.HubOnly
 	if err := save(cc); err != nil {
 		return nil, err
 	}
@@ -131,6 +133,7 @@ func Sync() (*config.ClientConfig, *api.HeartbeatResponse, error) {
 	// Tracked verbatim: an empty value means the hub no longer offers an in-mesh
 	// control plane, and the client should stop preferring the old one.
 	cc.InternalURL = resp.ControlURL
+	cc.HubOnly = resp.HubOnly
 	if err := save(cc); err != nil {
 		return nil, nil, err
 	}
@@ -258,7 +261,63 @@ func Apply(cc *config.ClientConfig) (string, error) {
 	if err := wgctl.WriteConfigFile(confPath, iface); err != nil {
 		return confPath, err
 	}
-	return confPath, wgctl.Apply(iface)
+	if err := wgctl.Apply(iface); err != nil {
+		return confPath, err
+	}
+	return confPath, syncRoutes(cc)
+}
+
+// syncRoutes routes a hub-only client's granted ranges into the tunnel. Mesh
+// addresses are already routed by the interface address; anything else the
+// coordinator allows (pod ranges, networks next to the coordinator) needs a
+// kernel route. Mesh clients get none: there a CNI or the operator owns
+// routing, and any routes left from an earlier hub-only stint are removed.
+func syncRoutes(cc *config.ClientConfig) error {
+	var want []string
+	if cc.HubOnly {
+		want = hubRoutes(cc)
+	}
+	if len(want) == 0 && len(cc.ManagedRoutes) == 0 && !cc.HubOnly && !wgctl.TagsRoutes() {
+		return nil
+	}
+	managed, err := wgctl.SyncRoutes(cc.Interface, want, cc.ManagedRoutes)
+	if errors.Is(err, wgctl.ErrUnsupported) {
+		return nil
+	}
+	if strings.Join(managed, ",") != strings.Join(cc.ManagedRoutes, ",") {
+		cc.ManagedRoutes = managed
+		if serr := save(cc); serr != nil && err == nil {
+			err = serr
+		}
+	}
+	return err
+}
+
+// hubRoutes lists the coordinator peer's AllowedIPs that fall outside the mesh
+// range.
+func hubRoutes(cc *config.ClientConfig) []string {
+	mesh, err := netip.ParsePrefix(cc.IPRange)
+	if err != nil {
+		return nil
+	}
+	mesh = mesh.Masked()
+	var out []string
+	for _, p := range cc.Peers {
+		if p.ID != api.CoordinatorPeerID {
+			continue
+		}
+		for _, raw := range strings.Split(p.AllowedIPs, ",") {
+			q, err := netip.ParsePrefix(strings.TrimSpace(raw))
+			if err != nil {
+				continue
+			}
+			if q.Bits() >= mesh.Bits() && mesh.Contains(q.Addr()) {
+				continue
+			}
+			out = append(out, q.Masked().String())
+		}
+	}
+	return out
 }
 
 // --- internals ---

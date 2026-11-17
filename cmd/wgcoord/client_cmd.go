@@ -164,6 +164,11 @@ func clientStatusCmd() *cobra.Command {
 			}
 			fmt.Printf("  coordinator %s\n", coord)
 			fmt.Printf("  interface %s (udp/%d), address %s\n", cc.Interface, cc.ListenPort, orStr(cc.Address, "-"))
+			if cc.HubOnly {
+				fmt.Println("  mode hub-only (all traffic goes through the coordinator, which enforces this client's grants)")
+			} else {
+				fmt.Println("  mode mesh")
+			}
 			fmt.Printf("  public key %s\n", cc.PublicKey)
 			if cc.PublicEndpoint != "" {
 				fmt.Printf("  public endpoint %s\n", cc.PublicEndpoint)

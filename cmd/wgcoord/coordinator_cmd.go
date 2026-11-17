@@ -27,6 +27,8 @@ func coordinatorCmd() *cobra.Command {
 		coordRunCmd(),
 		coordClientCmd(),
 		coordRouteCmd(),
+		coordGroupCmd(),
+		coordGrantCmd(),
 		coordTokenCmd(),
 		coordBlacklistCmd(),
 		coordStatusCmd(),
@@ -142,39 +144,103 @@ func coordRunCmd() *cobra.Command {
 
 func coordClientCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "client", Short: "Manage named clients"}
-	cmd.AddCommand(coordClientAddCmd(), coordClientRemoveCmd(), coordClientRenameCmd())
+	cmd.AddCommand(coordClientAddCmd(), coordClientRemoveCmd(), coordClientRenameCmd(), coordClientModeCmd())
 	return cmd
 }
 
 func coordClientAddCmd() *cobra.Command {
 	var address string
-	var routes []string
+	var routes, grants []string
+	var hubOnly bool
 	c := &cobra.Command{
 		Use:   "add <name>",
 		Args:  cobra.ExactArgs(1),
 		Short: "Create a named client and print its one-time auth token",
+		Long: "Create a named client and print its one-time auth token.\n\n" +
+			"A mesh client (the default) peers with every node. A --hub-only client peers\n" +
+			"with the coordinator alone; the coordinator forwards its traffic and its\n" +
+			"firewall limits it to the client's grants (--grant, or `coordinator grant add`).",
 		RunE: func(_ *cobra.Command, args []string) error {
-			cl, tok, err := coordinator.NewStore().AddClient(args[0], address, routes)
+			res, err := coordinator.NewStore().AddClient(args[0], coordinator.ClientOptions{
+				Address: address, Routes: routes, HubOnly: hubOnly, Grants: grants,
+			})
 			if err != nil {
 				return err
 			}
+			cl, tok := res.Client, res.Token
 			_, cc, _ := config.LoadCoordinator()
 			fmt.Printf("Client %q created\n", cl.Name)
 			fmt.Printf("  id:      %s\n", cl.ID)
 			fmt.Printf("  address: %s\n", cl.Address)
+			fmt.Printf("  mode:    %s\n", modeName(cl))
 			if len(cl.Routes) > 0 {
 				fmt.Printf("  routes:  %s\n", strings.Join(cl.Routes, ", "))
+			}
+			if len(cl.Grants) > 0 {
+				fmt.Printf("  grants:  %s\n", grantsCell(cl))
+			}
+			for _, w := range res.Warnings {
+				fmt.Printf("  warning: %s\n", w)
 			}
 			fmt.Printf("  token:   %s\n", tok)
 			fmt.Println("\nOn the client machine run:")
 			fmt.Printf("  wgcoord client join --server %s --token %s\n", coordinatorURLHint(cc), tok)
+			if cl.HubOnly && cl.Grants == nil {
+				fmt.Printf("\nIt can reach nothing yet: grant access with `wgcoord coordinator grant add %s <cidr|group>`.\n", cl.Name)
+			}
 			fmt.Println("\n⚠  The token is shown once. Store it now; regenerate with `wgcoord coordinator token regenerate` if lost.")
 			return nil
 		},
 	}
 	c.Flags().StringVar(&address, "address", "", "assign a specific mesh IP (default: auto-allocate lowest free)")
-	c.Flags().StringArrayVar(&routes, "route", nil, "extra CIDR this client carries, added to its advertised AllowedIPs (e.g. a pod subnet); repeatable")
+	c.Flags().StringArrayVar(&routes, "route", nil, "CIDR or group this client carries, added to its advertised AllowedIPs (e.g. a pod subnet); repeatable")
+	c.Flags().BoolVar(&hubOnly, "hub-only", false, "peer with the coordinator only; access is limited to the client's grants")
+	c.Flags().StringArrayVar(&grants, "grant", nil, "CIDR, group or \"all\" a hub-only client may reach; repeatable (ports: use `coordinator grant add`)")
 	return c
+}
+
+func coordClientModeCmd() *cobra.Command {
+	var clearGrants bool
+	c := &cobra.Command{
+		Use:   "mode <name> mesh|hub-only",
+		Args:  cobra.ExactArgs(2),
+		Short: "Switch a client between mesh and hub-only",
+		Long: "Switch a client between mesh (peers with every node, full access) and hub-only\n" +
+			"(peers with the coordinator alone, limited to its grants). Leaving hub-only\n" +
+			"while grants exist needs --clear-grants, so widening access is deliberate.",
+		RunE: func(_ *cobra.Command, args []string) error {
+			var hubOnly bool
+			switch args[1] {
+			case "hub-only", "hubonly", "hub":
+				hubOnly = true
+			case "mesh":
+			default:
+				return fmt.Errorf("unknown mode %q (want mesh or hub-only)", args[1])
+			}
+			changed, err := coordinator.NewStore().SetMode(args[0], hubOnly, clearGrants)
+			if err != nil {
+				return err
+			}
+			if !changed {
+				fmt.Printf("%q is already %s.\n", args[0], args[1])
+				return nil
+			}
+			fmt.Printf("%q is now %s. Every node picks this up on its next heartbeat.\n", args[0], args[1])
+			if hubOnly {
+				fmt.Printf("Grant access with `wgcoord coordinator grant add %s <cidr|group>`.\n", args[0])
+			}
+			return nil
+		},
+	}
+	c.Flags().BoolVar(&clearGrants, "clear-grants", false, "drop the client's grants when switching to mesh")
+	return c
+}
+
+func modeName(cl *config.Client) string {
+	if cl.HubOnly {
+		return "hub-only"
+	}
+	return "mesh"
 }
 
 func coordClientRemoveCmd() *cobra.Command {
@@ -221,19 +287,24 @@ func coordRouteCmd() *cobra.Command {
 			"appended to the AllowedIPs advertised for that node, so peers send the subnet\n" +
 			"through its tunnel. Use this to let Kubernetes pod traffic (or any subnet\n" +
 			"behind a node) cross the mesh. <node> is a client name, or \"coordinator\" for\n" +
-			"the hub. Changes reach every peer on its next heartbeat (≤ the beat interval).",
+			"the hub. A route may be a CIDR or a port-free group. Changes reach every peer\n" +
+			"on its next heartbeat (≤ the beat interval).",
 	}
 	cmd.AddCommand(coordRouteAddCmd(), coordRouteRemoveCmd(), coordRouteListCmd())
 	return cmd
 }
 
 func coordRouteAddCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "add <node> <cidr> [<cidr>...]",
+	var nat bool
+	c := &cobra.Command{
+		Use:   "add <node> <cidr|group> [<cidr|group>...]",
 		Short: "Add one or more routes to a node's advertised AllowedIPs",
-		Args:  cobra.MinimumNArgs(2),
+		Long: "Add routes to a node. --nat (coordinator only) marks networks next to the\n" +
+			"coordinator, such as a cloud VPC: the coordinator forwards mesh traffic into\n" +
+			"them and masquerades it, so hosts there need no route back to the mesh.",
+		Args: cobra.MinimumNArgs(2),
 		RunE: func(_ *cobra.Command, args []string) error {
-			added, err := coordinator.NewStore().AddRoutes(args[0], args[1:])
+			added, err := coordinator.NewStore().AddRoutes(args[0], args[1:], nat)
 			if err != nil {
 				return err
 			}
@@ -241,16 +312,22 @@ func coordRouteAddCmd() *cobra.Command {
 				fmt.Printf("No new routes for %q (already present).\n", args[0])
 				return nil
 			}
-			fmt.Printf("Added to %q: %s\n", args[0], strings.Join(added, ", "))
+			suffix := ""
+			if nat {
+				suffix = " (NAT)"
+			}
+			fmt.Printf("Added to %q: %s%s\n", args[0], strings.Join(added, ", "), suffix)
 			fmt.Println("Peers pick this up on their next heartbeat.")
 			return nil
 		},
 	}
+	c.Flags().BoolVar(&nat, "nat", false, "coordinator only: masquerade mesh traffic into this network next to the coordinator")
+	return c
 }
 
 func coordRouteRemoveCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:     "remove <node> <cidr> [<cidr>...]",
+		Use:     "remove <node> <cidr|group> [<cidr|group>...]",
 		Aliases: []string{"rm", "delete"},
 		Short:   "Remove one or more routes from a node's advertised AllowedIPs",
 		Args:    cobra.MinimumNArgs(2),
@@ -276,33 +353,59 @@ func coordRouteListCmd() *cobra.Command {
 		Short: "List routes for a node, or every node when omitted",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
+			_, cc, err := config.LoadCoordinator()
+			if err != nil {
+				return err
+			}
 			if len(args) == 1 {
 				routes, name, err := coordinator.NewStore().Routes(args[0])
 				if err != nil {
 					return err
 				}
-				printRoutes(name, routes)
+				printRoutes(cc, name, routes)
 				return nil
 			}
-			_, cc, err := config.LoadCoordinator()
-			if err != nil {
-				return err
-			}
-			printRoutes("coordinator", cc.Routes)
+			printRoutes(cc, "coordinator", cc.Routes)
 			for _, cl := range cc.Clients {
-				printRoutes(cl.Name, cl.Routes)
+				if cl.HubOnly {
+					continue
+				}
+				printRoutes(cc, cl.Name, cl.Routes)
 			}
 			return nil
 		},
 	}
 }
 
-func printRoutes(name string, routes []string) {
+func printRoutes(cc *config.CoordinatorConfig, name string, routes []string) {
 	if len(routes) == 0 {
 		fmt.Printf("%s: (none)\n", name)
 		return
 	}
-	fmt.Printf("%s: %s\n", name, strings.Join(routes, ", "))
+	fmt.Printf("%s: %s\n", name, describeRefs(cc, routes, name == "coordinator"))
+}
+
+// describeRefs renders route refs, expanding groups and marking NAT routes:
+// "10.42.0.0/24, cloud-net (10.0.0.0/16) [nat]".
+func describeRefs(cc *config.CoordinatorConfig, refs []string, hub bool) string {
+	parts := make([]string, 0, len(refs))
+	for _, r := range refs {
+		part := r
+		if exp := coordinator.ResolveRoutes(cc, []string{r}); len(exp) > 0 && (len(exp) != 1 || exp[0] != r) {
+			part += " (" + strings.Join(exp, ", ") + ")"
+		} else if len(exp) == 0 {
+			part += " (empty group)"
+		}
+		if hub {
+			for _, n := range cc.NATRoutes {
+				if n == r {
+					part += " [nat]"
+				}
+			}
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, ", ")
 }
 
 func coordTokenCmd() *cobra.Command {
@@ -366,7 +469,14 @@ func coordStatusCmd() *cobra.Command {
 			fmt.Printf("  interface %s (udp/%d), control tcp/%d\n", cc.Interface, cc.ListenPort, cc.ControlPort)
 			fmt.Printf("  range %s, hub %s\n", cc.IPRange, cc.Address)
 			if len(cc.Routes) > 0 {
-				fmt.Printf("  routes %s\n", strings.Join(cc.Routes, ", "))
+				fmt.Printf("  routes %s\n", describeRefs(cc, cc.Routes, true))
+			}
+			if len(cc.Groups) > 0 {
+				names := make([]string, 0, len(cc.Groups))
+				for _, g := range cc.Groups {
+					names = append(names, g.Name)
+				}
+				fmt.Printf("  groups %s\n", strings.Join(names, ", "))
 			}
 			if cc.PublicEndpoint != "" {
 				fmt.Printf("  public %s\n", net.JoinHostPort(cc.PublicEndpoint, strconv.Itoa(cc.ListenPort)))
@@ -381,10 +491,10 @@ func coordStatusCmd() *cobra.Command {
 				return nil
 			}
 			tw := tabwriter.NewWriter(cmdOut, 0, 2, 2, ' ', 0)
-			fmt.Fprintln(tw, "NAME\tADDRESS\tROUTES\tPUBLIC KEY\tENDPOINT\tSTATUS\tLAST SEEN")
+			fmt.Fprintln(tw, "NAME\tADDRESS\tMODE\tROUTES\tGRANTS\tPUBLIC KEY\tENDPOINT\tSTATUS\tLAST SEEN")
 			for _, cl := range cc.Clients {
-				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-					cl.Name, cl.Address, routesCell(cl.Routes), shortKey(cl.PublicKey), orStr(cl.Endpoint, "-"),
+				fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					cl.Name, cl.Address, modeName(cl), routesCell(cl.Routes), grantsCell(cl), shortKey(cl.PublicKey), orStr(cl.Endpoint, "-"),
 					clientStatus(cl), relTime(cl.LastSeenAt))
 			}
 			return tw.Flush()

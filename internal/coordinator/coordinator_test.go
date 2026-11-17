@@ -79,7 +79,7 @@ func TestDesiredInterfaceIncludesRoutes(t *testing.T) {
 			{ID: "a", Name: "node1", PublicKey: "apub", Address: "10.8.0.2", Routes: []string{"10.12.1.0/24", "10.13.0.0/16"}},
 		},
 	}
-	iface, err := desiredInterface(cc)
+	iface, err := desiredInterface(cc, true)
 	if err != nil {
 		t.Fatalf("desiredInterface: %v", err)
 	}
@@ -130,12 +130,12 @@ func loadCC(t *testing.T) *config.CoordinatorConfig {
 
 func TestAddRoutesClient(t *testing.T) {
 	s := newCoordConfig(t)
-	if _, _, err := s.AddClient("node1", "10.8.0.2", nil); err != nil {
+	if _, err := s.AddClient("node1", ClientOptions{Address: "10.8.0.2"}); err != nil {
 		t.Fatalf("add client: %v", err)
 	}
 
 	// Host bits get masked; a duplicate and a repeat are ignored.
-	added, err := s.AddRoutes("node1", []string{"10.12.1.5/24", "10.12.1.9/24", "10.13.0.0/16"})
+	added, err := s.AddRoutes("node1", []string{"10.12.1.5/24", "10.12.1.9/24", "10.13.0.0/16"}, false)
 	if err != nil {
 		t.Fatalf("add routes: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestAddRoutesClient(t *testing.T) {
 	}
 
 	// A second add of the same route reports nothing new and bumps nothing.
-	added, err = s.AddRoutes("node1", []string{"10.12.1.0/24"})
+	added, err = s.AddRoutes("node1", []string{"10.12.1.0/24"}, false)
 	if err != nil {
 		t.Fatalf("add routes again: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestAddRoutesClient(t *testing.T) {
 
 func TestRoutesHub(t *testing.T) {
 	s := newCoordConfig(t)
-	if _, err := s.AddRoutes("coordinator", []string{"10.12.0.0/24"}); err != nil {
+	if _, err := s.AddRoutes("coordinator", []string{"10.12.0.0/24"}, false); err != nil {
 		t.Fatalf("add hub route: %v", err)
 	}
 	cc := loadCC(t)
@@ -189,17 +189,17 @@ func TestRoutesHub(t *testing.T) {
 
 func TestRoutesUnknownNode(t *testing.T) {
 	s := newCoordConfig(t)
-	if _, err := s.AddRoutes("ghost", []string{"10.12.1.0/24"}); err == nil {
+	if _, err := s.AddRoutes("ghost", []string{"10.12.1.0/24"}, false); err == nil {
 		t.Fatal("adding routes to an unknown node should error")
 	}
 }
 
 func TestAddRoutesRejectsBadCIDR(t *testing.T) {
 	s := newCoordConfig(t)
-	if _, _, err := s.AddClient("node1", "10.8.0.2", nil); err != nil {
+	if _, err := s.AddClient("node1", ClientOptions{Address: "10.8.0.2"}); err != nil {
 		t.Fatalf("add client: %v", err)
 	}
-	if _, err := s.AddRoutes("node1", []string{"not-a-cidr"}); err == nil {
+	if _, err := s.AddRoutes("node1", []string{"not-a-cidr"}, false); err == nil {
 		t.Fatal("a bad CIDR should be rejected")
 	}
 	if got := loadCC(t).Clients[0].Routes; len(got) != 0 {
@@ -267,5 +267,45 @@ func TestHeartbeatReAdvertisesHubOnRouteChange(t *testing.T) {
 	}
 	if hubPeer.AllowedIPs != "10.8.0.1/32, 10.12.0.0/24" {
 		t.Errorf("hub AllowedIPs = %q; want %q", hubPeer.AllowedIPs, "10.8.0.1/32, 10.12.0.0/24")
+	}
+}
+
+// TestHeartbeatSameSecondChangeIsNotLost covers a change made in the same
+// second as the client's previous heartbeat. Timestamps have one-second
+// resolution, so a strict "newer than" check would skip it forever.
+func TestHeartbeatSameSecondChangeIsNotLost(t *testing.T) {
+	config.SetPath(filepath.Join(t.TempDir(), "config.json"))
+	t.Cleanup(func() { config.SetPath("") })
+	hub, _ := wgkey.Generate()
+	a, _ := wgkey.Generate()
+	tokA, _ := token.Generate()
+	cc := &config.CoordinatorConfig{
+		ControlPort: 51821, Interface: "wg0", ListenPort: 51820,
+		IPRange: "10.8.0.0/24", Address: "10.8.0.1", PublicKey: hub.PublicKey,
+		UpdatedAt: "2020-01-01T00:00:00Z", // changed in the same second as A's last beat
+		Clients: []*config.Client{
+			{ID: "a", Name: "node1", TokenHash: token.Hash(tokA), Address: "10.8.0.2",
+				PublicKey: a.PublicKey, LastSeenAt: "2020-01-01T00:00:00Z"},
+		},
+	}
+	if err := config.Save(&config.Config{Mode: config.ModeCoordinator, Coordinator: cc}); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(NewServer(NewStore()).Handler())
+	t.Cleanup(srv.Close)
+	body, _ := json.Marshal(api.HeartbeatRequest{Have: []string{api.CoordinatorPeerID}})
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/heartbeat", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+tokA)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var hb api.HeartbeatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&hb); err != nil {
+		t.Fatal(err)
+	}
+	if len(hb.Add) != 1 || hb.Add[0].ID != api.CoordinatorPeerID {
+		t.Fatalf("a same-second change must be re-sent, got Add=%+v", hb.Add)
 	}
 }

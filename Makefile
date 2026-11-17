@@ -4,7 +4,7 @@ INSTALL_DIR ?= /usr/local/bin
 
 LDFLAGS := -s -w
 
-.PHONY: build install uninstall run-coordinator run-client test vet fmt tidy clean
+.PHONY: build install uninstall run-coordinator run-client test e2e vet fmt tidy clean
 
 build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN) $(PKG)
@@ -27,6 +27,10 @@ tidy:
 
 test:
 	go test ./...
+
+# End-to-end suite in Docker; KEEP=1 leaves the containers running.
+e2e:
+	./e2e/run.sh
 
 clean:
 	rm -f $(BIN)

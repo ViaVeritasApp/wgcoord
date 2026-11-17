@@ -1,0 +1,54 @@
+# Topology for e2e/run.sh.
+#
+#   wan   172.28.0.0/24  the "internet": every WireGuard endpoint lives here
+#   cloud 172.30.0.0/24  a private network only the coordinator is attached to,
+#                        standing in for a cloud VPC with a managed database
+name: wgcoord-e2e
+
+x-host: &host
+  image: wgcoord-e2e:latest
+  privileged: true
+  init: true
+
+networks:
+  wan:
+    ipam:
+      config: [{ subnet: 172.28.0.0/24 }]
+  cloud:
+    internal: true
+    ipam:
+      config: [{ subnet: 172.30.0.0/24 }]
+
+services:
+  coordinator:
+    <<: *host
+    container_name: wgcoord-e2e-coordinator
+    hostname: coordinator
+    networks:
+      wan: { ipv4_address: 172.28.0.10 }
+      cloud: { ipv4_address: 172.30.0.2 }
+  node1:
+    <<: *host
+    container_name: wgcoord-e2e-node1
+    hostname: node1
+    networks: { wan: { ipv4_address: 172.28.0.21 } }
+  node2:
+    <<: *host
+    container_name: wgcoord-e2e-node2
+    hostname: node2
+    networks: { wan: { ipv4_address: 172.28.0.22 } }
+  alice:
+    <<: *host
+    container_name: wgcoord-e2e-alice
+    hostname: alice
+    networks: { wan: { ipv4_address: 172.28.0.101 } }
+  bob:
+    <<: *host
+    container_name: wgcoord-e2e-bob
+    hostname: bob
+    networks: { wan: { ipv4_address: 172.28.0.102 } }
+  clouddb:
+    <<: *host
+    container_name: wgcoord-e2e-clouddb
+    hostname: clouddb
+    networks: { cloud: { ipv4_address: 172.30.0.5 } }
